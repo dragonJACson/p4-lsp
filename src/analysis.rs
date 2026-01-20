@@ -1,47 +1,169 @@
 use p4::ast::{AST, Control, Header, Parser, Struct, Extern, Action, Direction, Type};
+use p4::ast::Typedef;
 use p4::lexer::Token;
 use ropey::Rope;
 use tower_lsp::lsp_types::*;
 
 fn builtin_semantic_token_type(name: &str) -> Option<SemanticTokenType> {
     match name {
+        // Core library: actions
         "NoAction" => Some(SemanticTokenType::FUNCTION),
-        "accept" | "reject" => Some(SemanticTokenType::KEYWORD),
-        "packet_in"
-        | "packet_out"
-        | "void"
-        | "tuple"
-        | "match_kind"
-        | "standard_metadata_t" => Some(SemanticTokenType::TYPE),
-        "standard_metadata" => Some(SemanticTokenType::VARIABLE),
+
+        // Core library: parser states and control flow keywords
+        "accept" | "reject" | "exit" | "default" | "switch" | "verify" => {
+            Some(SemanticTokenType::KEYWORD)
+        }
+
+        // Core library: extern types
+        "packet_in" | "packet_out" => Some(SemanticTokenType::TYPE),
+
+        // Core library: built-in types
+        "void" | "tuple" | "match_kind" => Some(SemanticTokenType::TYPE),
+
+        // Core library: error members (from core.p4)
         "NoError"
         | "PacketTooShort"
         | "NoMatch"
         | "StackOutOfBounds"
         | "HeaderTooShort"
-        | "ParserTimeout" => Some(SemanticTokenType::VARIABLE),
+        | "ParserTimeout"
+        | "ParserInvalidArgument" => Some(SemanticTokenType::ENUM_MEMBER),
+
+        // Core library: match_kind values (from core.p4)
+        "exact" | "ternary" | "lpm" => Some(SemanticTokenType::ENUM_MEMBER),
+
+        // Core library: extern methods (packet_in)
+        "extract" | "lookahead" | "advance" | "length" => Some(SemanticTokenType::METHOD),
+
+        // Core library: extern methods (packet_out)
+        "emit" => Some(SemanticTokenType::METHOD),
+
+        // Core library: header methods
+        "isValid" | "setValid" | "setInvalid" => Some(SemanticTokenType::METHOD),
+
+        // Core library: functions
+        "static_assert" => Some(SemanticTokenType::FUNCTION),
+
+        // v1model architecture: match_kind extensions
+        "range" | "optional" | "selector" => Some(SemanticTokenType::ENUM_MEMBER),
+
+        // v1model architecture: types
+        "standard_metadata_t" => Some(SemanticTokenType::STRUCT),
+        "CounterType" | "MeterType" | "CloneType" | "HashAlgorithm" => Some(SemanticTokenType::TYPE),
+
+        // v1model architecture: variables
+        "standard_metadata" => Some(SemanticTokenType::VARIABLE),
+
+        // v1model architecture: enum values
+        "packets" | "bytes" | "packets_and_bytes" => Some(SemanticTokenType::ENUM_MEMBER),
+
+        // v1model architecture: externs
+        "counter"
+        | "direct_counter"
+        | "meter"
+        | "direct_meter"
+        | "register"
+        | "action_profile"
+        | "action_selector"
+        | "Checksum16"
+        | "random"
+        | "digest"
+        | "resubmit"
+        | "recirculate"
+        | "clone"
+        | "clone3"
+        | "truncate"
+        | "hash"
+        | "mark_to_drop"
+        | "log_msg" => Some(SemanticTokenType::FUNCTION),
+
         _ => None,
     }
 }
 
 fn builtin_hover(name: &str) -> Option<&'static str> {
     match name {
-        "NoAction" => Some("```p4\naction NoAction()\n```\nBuilt-in action."),
-        "accept" => Some("```p4\naccept\n```\nBuilt-in parser state."),
-        "reject" => Some("```p4\nreject\n```\nBuilt-in parser state."),
-        "packet_in" => Some("```p4\npacket_in\n```\nBuilt-in type."),
-        "packet_out" => Some("```p4\npacket_out\n```\nBuilt-in type."),
-        "void" => Some("```p4\nvoid\n```\nBuilt-in type."),
-        "tuple" => Some("```p4\ntuple\n```\nBuilt-in type."),
-        "match_kind" => Some("```p4\nmatch_kind\n```\nBuilt-in type."),
-        "standard_metadata_t" => Some("```p4\nstandard_metadata_t\n```\nCommon built-in type (architecture-defined)."),
-        "standard_metadata" => Some("```p4\nstandard_metadata\n```\nCommon built-in variable (architecture-defined)."),
-        "NoError" => Some("```p4\nNoError\n```\nCommon built-in error member (core library)."),
-        "PacketTooShort" => Some("```p4\nPacketTooShort\n```\nCommon built-in error member (core library)."),
-        "NoMatch" => Some("```p4\nNoMatch\n```\nCommon built-in error member (core library)."),
-        "StackOutOfBounds" => Some("```p4\nStackOutOfBounds\n```\nCommon built-in error member (core library)."),
-        "HeaderTooShort" => Some("```p4\nHeaderTooShort\n```\nCommon built-in error member (core library)."),
-        "ParserTimeout" => Some("```p4\nParserTimeout\n```\nCommon built-in error member (core library)."),
+        // Core library: actions
+        "NoAction" => Some("```p4\n@noWarn(\"unused\")\naction NoAction() {}\n```\nBuilt-in action that does nothing (core.p4)."),
+
+        // Core library: parser states
+        "accept" => Some("```p4\naccept\n```\nBuilt-in parser state indicating successful parsing."),
+        "reject" => Some("```p4\nreject\n```\nBuilt-in parser state indicating parsing failure."),
+
+        // Core library: extern types
+        "packet_in" => Some("```p4\nextern packet_in {\n    void extract<T>(out T hdr);\n    void extract<T>(out T variableSizeHeader, in bit<32> variableFieldSizeInBits);\n    T lookahead<T>();\n    void advance(in bit<32> sizeInBits);\n    bit<32> length();\n}\n```\nBuilt-in extern representing incoming network packets (core.p4)."),
+        "packet_out" => Some("```p4\nextern packet_out {\n    void emit<T>(in T hdr);\n}\n```\nBuilt-in extern for constructing output packets (core.p4)."),
+
+        // Core library: types
+        "void" => Some("```p4\nvoid\n```\nBuilt-in type representing no value."),
+        "tuple" => Some("```p4\ntuple<T1, T2, ...>\n```\nBuilt-in tuple type."),
+        "match_kind" => Some("```p4\nmatch_kind\n```\nBuilt-in type for table key match types (exact, ternary, lpm)."),
+
+        // Core library: error members
+        "NoError" => Some("```p4\nerror.NoError\n```\nNo error (core.p4)."),
+        "PacketTooShort" => Some("```p4\nerror.PacketTooShort\n```\nNot enough bits in packet for 'extract' (core.p4)."),
+        "NoMatch" => Some("```p4\nerror.NoMatch\n```\n'select' expression has no matches (core.p4)."),
+        "StackOutOfBounds" => Some("```p4\nerror.StackOutOfBounds\n```\nReference to invalid element of a header stack (core.p4)."),
+        "HeaderTooShort" => Some("```p4\nerror.HeaderTooShort\n```\nExtracting too many bits into a varbit field (core.p4)."),
+        "ParserTimeout" => Some("```p4\nerror.ParserTimeout\n```\nParser execution time limit exceeded (core.p4)."),
+        "ParserInvalidArgument" => Some("```p4\nerror.ParserInvalidArgument\n```\nParser operation was called with a value not supported by the implementation (core.p4)."),
+
+        // Core library: match_kind values
+        "exact" => Some("```p4\nmatch_kind exact\n```\nMatch bits exactly (core.p4)."),
+        "ternary" => Some("```p4\nmatch_kind ternary\n```\nTernary match, using a mask (core.p4)."),
+        "lpm" => Some("```p4\nmatch_kind lpm\n```\nLongest-prefix match (core.p4)."),
+
+        // Core library: packet_in methods
+        "extract" => Some("```p4\nvoid extract<T>(out T hdr)\nvoid extract<T>(out T variableSizeHeader, in bit<32> variableFieldSizeInBits)\n```\nRead a header from the packet and advance the cursor (core.p4)."),
+        "lookahead" => Some("```p4\nT lookahead<T>()\n```\nRead bits from the packet without advancing the cursor (core.p4)."),
+        "advance" => Some("```p4\nvoid advance(in bit<32> sizeInBits)\n```\nAdvance the packet cursor by the specified number of bits (core.p4)."),
+        "length" => Some("```p4\nbit<32> length()\n```\nReturn packet length in bytes (core.p4)."),
+
+        // Core library: packet_out methods
+        "emit" => Some("```p4\nvoid emit<T>(in T hdr)\n```\nWrite header into the output packet, advancing cursor (core.p4)."),
+
+        // Core library: header methods
+        "isValid" => Some("```p4\nbool isValid()\n```\nReturn true if the header is valid."),
+        "setValid" => Some("```p4\nvoid setValid()\n```\nMark the header as valid."),
+        "setInvalid" => Some("```p4\nvoid setInvalid()\n```\nMark the header as invalid."),
+
+        // Core library: functions
+        "verify" => Some("```p4\nextern void verify(in bool check, in error toSignal)\n```\nCheck a predicate in the parser; if false, set parser error and transition to reject (core.p4)."),
+        "static_assert" => Some("```p4\nextern bool static_assert(bool check, string message)\nextern bool static_assert(bool check)\n```\nEvaluate a boolean expression at compile time; stop compilation if false (core.p4)."),
+
+        // Control flow
+        "exit" => Some("```p4\nexit\n```\nStatement that causes immediate exit from the enclosing control block."),
+        "this" => Some("```p4\nthis\n```\nReference to the enclosing object."),
+        "default" => Some("```p4\ndefault\n```\nDefault case in select/switch statements."),
+
+        // v1model architecture: match_kind extensions
+        "range" => Some("```p4\nmatch_kind range\n```\nRange match (v1model)."),
+        "optional" => Some("```p4\nmatch_kind optional\n```\nEither an exact match or a wildcard (v1model)."),
+        "selector" => Some("```p4\nmatch_kind selector\n```\nUsed for implementing dynamic_action_selection (v1model)."),
+
+        // v1model architecture: types
+        "standard_metadata_t" => Some("```p4\nstruct standard_metadata_t {\n    bit<9> ingress_port;\n    bit<9> egress_spec;\n    bit<9> egress_port;\n    // ... additional fields\n}\n```\nStandard metadata structure (v1model)."),
+        "standard_metadata" => Some("```p4\nstandard_metadata_t standard_metadata\n```\nStandard metadata variable passed to ingress/egress controls (v1model)."),
+        "CounterType" => Some("```p4\nenum CounterType {\n    packets,\n    bytes,\n    packets_and_bytes\n}\n```\nCounter type enumeration (v1model)."),
+        "MeterType" => Some("```p4\nenum MeterType {\n    packets,\n    bytes\n}\n```\nMeter type enumeration (v1model)."),
+
+        // v1model architecture: externs
+        "counter" => Some("```p4\nextern counter<I> {\n    counter(bit<32> size, CounterType type);\n    void count(in I index);\n}\n```\nCounter extern (v1model)."),
+        "direct_counter" => Some("```p4\nextern direct_counter {\n    direct_counter(CounterType type);\n    void count();\n}\n```\nDirect counter associated with a table (v1model)."),
+        "meter" => Some("```p4\nextern meter<I> {\n    meter(bit<32> size, MeterType type);\n    void execute_meter<T>(in I index, out T result);\n}\n```\nMeter extern (v1model)."),
+        "direct_meter" => Some("```p4\nextern direct_meter<T> {\n    direct_meter(MeterType type);\n    void read(out T result);\n}\n```\nDirect meter associated with a table (v1model)."),
+        "register" => Some("```p4\nextern register<T, I> {\n    register(bit<32> size);\n    void read(out T result, in I index);\n    void write(in I index, in T value);\n}\n```\nStateful register array (v1model)."),
+        "mark_to_drop" => Some("```p4\nextern void mark_to_drop(inout standard_metadata_t sm)\n```\nMark the packet to be dropped (v1model)."),
+        "hash" => Some("```p4\nextern void hash<O, T, D, M>(out O result, in HashAlgorithm algo, in T base, in D data, in M max)\n```\nCompute a hash function (v1model)."),
+        "random" => Some("```p4\nextern void random<T>(out T result, in T lo, in T hi)\n```\nGenerate a random number in [lo, hi] (v1model)."),
+        "digest" => Some("```p4\nextern void digest<T>(in bit<32> receiver, in T data)\n```\nSend a digest message to the control plane (v1model)."),
+        "resubmit" => Some("```p4\nextern void resubmit<T>(in T data)\n```\nResubmit the packet to ingress (v1model)."),
+        "recirculate" => Some("```p4\nextern void recirculate<T>(in T data)\n```\nRecirculate the packet (v1model)."),
+        "clone" => Some("```p4\nextern void clone(in CloneType type, in bit<32> session)\n```\nClone the packet (v1model)."),
+        "clone3" => Some("```p4\nextern void clone3<T>(in CloneType type, in bit<32> session, in T data)\n```\nClone the packet with metadata (v1model)."),
+        "truncate" => Some("```p4\nextern void truncate(in bit<32> length)\n```\nTruncate the packet to specified length (v1model)."),
+        "log_msg" => Some("```p4\nextern void log_msg(string msg)\nextern void log_msg<T>(string msg, in T data)\n```\nLog a message for debugging (v1model)."),
+
         _ => None,
     }
 }
@@ -104,6 +226,12 @@ pub fn get_hover_info(ast: &AST, content: &Rope, position: Position) -> Option<S
 
     if let Some(ext) = ast.get_extern(&word) {
         return Some(format_extern_hover(ext));
+    }
+
+    for td in &ast.typedefs {
+        if td.name == word {
+            return Some(format_typedef_hover(ast, td));
+        }
     }
 
     for control in &ast.controls {
@@ -892,6 +1020,33 @@ fn format_action_hover(action: &Action, control_name: &str) -> String {
     format!("```p4\n// in control {}\naction {}({})\n```", control_name, action.name, params.join(", "))
 }
 
+fn format_typedef_hover(ast: &AST, td: &Typedef) -> String {
+    let mut result = format!("```p4\ntypedef {} {}\n```", format_type_alias(ast, &td.ty), td.name);
+    if let Type::UserDefined(name) = &td.ty {
+        if let Some(header) = ast.get_header(&name) {
+            result.push_str("\n\n");
+            result.push_str(&format_header_hover(header));
+        } else if let Some(s) = ast.get_struct(&name) {
+            result.push_str("\n\n");
+            result.push_str(&format_struct_hover(s));
+        }
+    }
+    result
+}
+
+fn format_type_alias(ast: &AST, ty: &Type) -> String {
+    match ty {
+        Type::UserDefined(name) => {
+            if let Some(typedef) = ast.typedefs.iter().find(|td| td.name == *name) {
+                format_type_alias(ast, &typedef.ty)
+            } else {
+                name.clone()
+            }
+        }
+        _ => ty.to_string(),
+    }
+}
+
 fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
     let keywords = [
         ("action", "Define an action"),
@@ -920,6 +1075,20 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
         ("ternary", "Ternary match type"),
         ("transition", "Parser state transition"),
         ("typedef", "Type definition"),
+        ("abstract", "Abstract declaration modifier"),
+        ("default", "Default case/action"),
+        ("enum", "Define an enumeration type"),
+        ("exit", "Exit the current control flow"),
+        ("header_union", "Define a header union type"),
+        ("list", "List type"),
+        ("match_kind", "Match kind type for table keys"),
+        ("switch", "Switch statement"),
+        ("this", "Reference to current instance"),
+        ("type", "Type alias declaration"),
+        ("value_set", "Parser value set"),
+        ("verify", "Verify statement in parser"),
+        ("void", "Void return type"),
+        ("tuple", "Tuple type"),
     ];
 
     for (kw, doc) in keywords {
@@ -931,7 +1100,7 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
         });
     }
 
-    let types = ["bit", "bool", "error", "int", "varbit"];
+    let types = ["bit", "bool", "error", "int", "varbit", "void", "tuple"];
     for ty in types {
         completions.push(CompletionItem {
             label: ty.to_string(),
@@ -942,23 +1111,85 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
     }
 
     let builtins = [
-        ("NoAction", CompletionItemKind::FUNCTION, "Built-in action"),
+        // Core library: actions
+        ("NoAction", CompletionItemKind::FUNCTION, "Built-in action (core.p4)"),
+
+        // Core library: parser states
         ("accept", CompletionItemKind::KEYWORD, "Built-in parser state"),
         ("reject", CompletionItemKind::KEYWORD, "Built-in parser state"),
-        ("packet_in", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("packet_out", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+
+        // Core library: extern types
+        ("packet_in", CompletionItemKind::CLASS, "Extern for incoming packets (core.p4)"),
+        ("packet_out", CompletionItemKind::CLASS, "Extern for outgoing packets (core.p4)"),
+
+        // Core library: types
         ("void", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("tuple", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("match_kind", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("string", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("NoError", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("PacketTooShort", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("NoMatch", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("StackOutOfBounds", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("HeaderTooShort", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("ParserTimeout", CompletionItemKind::CONSTANT, "Common built-in error member"),
-        ("standard_metadata_t", CompletionItemKind::TYPE_PARAMETER, "Common architecture type"),
-        ("standard_metadata", CompletionItemKind::VARIABLE, "Common architecture variable"),
+        ("tuple", CompletionItemKind::TYPE_PARAMETER, "Built-in tuple type"),
+        ("match_kind", CompletionItemKind::TYPE_PARAMETER, "Built-in type for match kinds"),
+        ("string", CompletionItemKind::TYPE_PARAMETER, "Built-in string type"),
+
+        // Core library: error members
+        ("NoError", CompletionItemKind::ENUM_MEMBER, "No error (core.p4)"),
+        ("PacketTooShort", CompletionItemKind::ENUM_MEMBER, "Not enough bits in packet (core.p4)"),
+        ("NoMatch", CompletionItemKind::ENUM_MEMBER, "No match in select (core.p4)"),
+        ("StackOutOfBounds", CompletionItemKind::ENUM_MEMBER, "Invalid stack element (core.p4)"),
+        ("HeaderTooShort", CompletionItemKind::ENUM_MEMBER, "Varbit extraction overflow (core.p4)"),
+        ("ParserTimeout", CompletionItemKind::ENUM_MEMBER, "Parser timeout (core.p4)"),
+        ("ParserInvalidArgument", CompletionItemKind::ENUM_MEMBER, "Invalid parser argument (core.p4)"),
+
+        // Core library: packet_in methods
+        ("extract", CompletionItemKind::METHOD, "Extract header from packet (core.p4)"),
+        ("lookahead", CompletionItemKind::METHOD, "Peek at packet bits (core.p4)"),
+        ("advance", CompletionItemKind::METHOD, "Advance packet cursor (core.p4)"),
+
+        // Core library: packet_out methods
+        ("emit", CompletionItemKind::METHOD, "Emit header to packet (core.p4)"),
+
+        // Core library: header methods
+        ("isValid", CompletionItemKind::METHOD, "Check if header is valid"),
+        ("setValid", CompletionItemKind::METHOD, "Mark header as valid"),
+        ("setInvalid", CompletionItemKind::METHOD, "Mark header as invalid"),
+
+        // Core library: functions
+        ("static_assert", CompletionItemKind::FUNCTION, "Compile-time assertion (core.p4)"),
+
+        // v1model architecture: types
+        ("standard_metadata_t", CompletionItemKind::STRUCT, "Standard metadata structure (v1model)"),
+        ("standard_metadata", CompletionItemKind::VARIABLE, "Standard metadata variable (v1model)"),
+        ("CounterType", CompletionItemKind::ENUM, "Counter type enum (v1model)"),
+        ("MeterType", CompletionItemKind::ENUM, "Meter type enum (v1model)"),
+        ("HashAlgorithm", CompletionItemKind::ENUM, "Hash algorithm enum (v1model)"),
+        ("CloneType", CompletionItemKind::ENUM, "Clone type enum (v1model)"),
+
+        // v1model architecture: match_kind extensions
+        ("optional", CompletionItemKind::ENUM_MEMBER, "Optional match kind (v1model)"),
+        ("selector", CompletionItemKind::ENUM_MEMBER, "Selector match kind (v1model)"),
+
+        // v1model architecture: enum values
+        ("packets", CompletionItemKind::ENUM_MEMBER, "Count packets (v1model)"),
+        ("bytes", CompletionItemKind::ENUM_MEMBER, "Count bytes (v1model)"),
+        ("packets_and_bytes", CompletionItemKind::ENUM_MEMBER, "Count both (v1model)"),
+
+        // v1model architecture: externs
+        ("counter", CompletionItemKind::CLASS, "Counter extern (v1model)"),
+        ("direct_counter", CompletionItemKind::CLASS, "Direct counter extern (v1model)"),
+        ("meter", CompletionItemKind::CLASS, "Meter extern (v1model)"),
+        ("direct_meter", CompletionItemKind::CLASS, "Direct meter extern (v1model)"),
+        ("register", CompletionItemKind::CLASS, "Register extern (v1model)"),
+        ("action_profile", CompletionItemKind::CLASS, "Action profile extern (v1model)"),
+        ("action_selector", CompletionItemKind::CLASS, "Action selector extern (v1model)"),
+
+        // v1model architecture: functions
+        ("mark_to_drop", CompletionItemKind::FUNCTION, "Mark packet to drop (v1model)"),
+        ("hash", CompletionItemKind::FUNCTION, "Compute hash (v1model)"),
+        ("random", CompletionItemKind::FUNCTION, "Generate random number (v1model)"),
+        ("digest", CompletionItemKind::FUNCTION, "Send digest to control plane (v1model)"),
+        ("resubmit", CompletionItemKind::FUNCTION, "Resubmit packet (v1model)"),
+        ("recirculate", CompletionItemKind::FUNCTION, "Recirculate packet (v1model)"),
+        ("clone", CompletionItemKind::FUNCTION, "Clone packet (v1model)"),
+        ("clone3", CompletionItemKind::FUNCTION, "Clone packet with metadata (v1model)"),
+        ("truncate", CompletionItemKind::FUNCTION, "Truncate packet (v1model)"),
+        ("log_msg", CompletionItemKind::FUNCTION, "Log debug message (v1model)"),
     ];
 
     for (label, kind, detail) in builtins {

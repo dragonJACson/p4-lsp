@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use log::info;
 use ropey::Rope;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -106,6 +107,10 @@ impl Backend {
                 SemanticTokenType::NUMBER,
                 SemanticTokenType::STRING,
                 SemanticTokenType::OPERATOR,
+                SemanticTokenType::ENUM_MEMBER,
+                SemanticTokenType::CLASS,
+                SemanticTokenType::STRUCT,
+                SemanticTokenType::ENUM,
             ],
             token_modifiers: Vec::new(),
         };
@@ -607,19 +612,19 @@ impl Backend {
             };
 
             for header in &ast.headers {
-                add(&header.token, SemanticTokenType::TYPE);
+                add(&header.token, SemanticTokenType::STRUCT);
                 for m in &header.members {
                     add(&m.token, SemanticTokenType::VARIABLE);
                 }
             }
             for s in &ast.structs {
-                add(&s.token, SemanticTokenType::TYPE);
+                add(&s.token, SemanticTokenType::STRUCT);
                 for m in &s.members {
                     add(&m.token, SemanticTokenType::VARIABLE);
                 }
             }
             for td in &ast.typedefs {
-                add(&td.token, SemanticTokenType::TYPE);
+                add(&td.token, SemanticTokenType::STRUCT);
             }
             for c in &ast.constants {
                 add(&c.token, SemanticTokenType::VARIABLE);
@@ -706,6 +711,38 @@ impl Backend {
             .map(|line| line.chars().collect())
             .collect();
 
+        let mut type_names = HashSet::new();
+        let mut action_names = HashSet::new();
+        if let Some(ast) = &doc.ast {
+            for header in &ast.headers {
+                type_names.insert(header.name.clone());
+            }
+            for s in &ast.structs {
+                type_names.insert(s.name.clone());
+            }
+            for td in &ast.typedefs {
+                type_names.insert(td.name.clone());
+            }
+            for ext in &ast.externs {
+                type_names.insert(ext.name.clone());
+            }
+            for control in &ast.controls {
+                type_names.insert(control.name.clone());
+                for action in &control.actions {
+                    action_names.insert(action.name.clone());
+                }
+            }
+            for parser in &ast.parsers {
+                type_names.insert(parser.name.clone());
+                for state in &parser.states {
+                    action_names.insert(state.name.clone());
+                }
+            }
+            for pkg in &ast.packages {
+                type_names.insert(pkg.name.clone());
+            }
+        }
+
         let mut lexer = Lexer::new(
             lines.iter().map(|s| s.as_str()).collect(),
             Arc::new(String::from("<memory>")),
@@ -745,16 +782,30 @@ impl Backend {
                 | p4::lexer::Kind::Extern
                 | p4::lexer::Kind::If
                 | p4::lexer::Kind::Else
-                | p4::lexer::Kind::Return => (Some(SemanticTokenType::KEYWORD), 1),
+                | p4::lexer::Kind::Return
+                | p4::lexer::Kind::Abstract
+                | p4::lexer::Kind::Accept
+                | p4::lexer::Kind::Default
+                | p4::lexer::Kind::Enum
+                | p4::lexer::Kind::Exit
+                | p4::lexer::Kind::HeaderUnion
+                | p4::lexer::Kind::List
+                | p4::lexer::Kind::MatchKind
+                | p4::lexer::Kind::Reject
+                | p4::lexer::Kind::This
+                | p4::lexer::Kind::Type
+                | p4::lexer::Kind::ValueSet
+                | p4::lexer::Kind::Verify
+                | p4::lexer::Kind::Void
+                | p4::lexer::Kind::Switch
+                | p4::lexer::Kind::Tuple => (Some(SemanticTokenType::KEYWORD), 1),
                 p4::lexer::Kind::Bool
                 | p4::lexer::Kind::Error
                 | p4::lexer::Kind::Bit
                 | p4::lexer::Kind::Varbit
                 | p4::lexer::Kind::Int
                 | p4::lexer::Kind::String => (Some(SemanticTokenType::TYPE), 1),
-                p4::lexer::Kind::PoundDefine | p4::lexer::Kind::PoundInclude => {
-                    (Some(SemanticTokenType::MACRO), 1)
-                }
+                p4::lexer::Kind::PoundDefine | p4::lexer::Kind::PoundInclude => (None, 1),
                 p4::lexer::Kind::IntLiteral(value) => {
                     (Some(SemanticTokenType::NUMBER), value.to_string().len() as u32)
                 }
@@ -788,9 +839,22 @@ impl Backend {
                 p4::lexer::Kind::Carat => (Some(SemanticTokenType::OPERATOR), 1),
                 p4::lexer::Kind::GreaterThanEquals => (Some(SemanticTokenType::OPERATOR), 2),
                 p4::lexer::Kind::LessThanEquals => (Some(SemanticTokenType::OPERATOR), 2),
+                p4::lexer::Kind::Shr => (Some(SemanticTokenType::OPERATOR), 2),
+                p4::lexer::Kind::Mul => (Some(SemanticTokenType::OPERATOR), 1),
+                p4::lexer::Kind::Div => (Some(SemanticTokenType::OPERATOR), 1),
+                p4::lexer::Kind::LogicalOr => (Some(SemanticTokenType::OPERATOR), 2),
+                p4::lexer::Kind::SaturatingAdd => (Some(SemanticTokenType::OPERATOR), 3),
+                p4::lexer::Kind::SaturatingSub => (Some(SemanticTokenType::OPERATOR), 3),
+                p4::lexer::Kind::PlusPlus => (Some(SemanticTokenType::OPERATOR), 2),
+                p4::lexer::Kind::Question => (Some(SemanticTokenType::OPERATOR), 1),
+                p4::lexer::Kind::ColonColon => (Some(SemanticTokenType::OPERATOR), 2),
                 p4::lexer::Kind::Identifier(value) => {
                     if let Some(token_type) = analysis::builtin_token_type_for_identifier(value) {
                         (Some(token_type), value.len() as u32)
+                    } else if type_names.contains(value) {
+                        (Some(SemanticTokenType::STRUCT), value.len() as u32)
+                    } else if action_names.contains(value) {
+                        (Some(SemanticTokenType::FUNCTION), value.len() as u32)
                     } else {
                         (Some(SemanticTokenType::VARIABLE), value.len() as u32)
                     }
@@ -867,8 +931,8 @@ fn token_relative(token: &p4::lexer::Token, content: &Rope) -> Option<(u32, u32,
         p4::lexer::Kind::Varbit => 6,
         p4::lexer::Kind::Int => 3,
         p4::lexer::Kind::String => 6,
-        p4::lexer::Kind::PoundDefine => 7,
-        p4::lexer::Kind::PoundInclude => 8,
+        p4::lexer::Kind::PoundDefine => 0,
+        p4::lexer::Kind::PoundInclude => 0,
         p4::lexer::Kind::DoubleEquals => 2,
         p4::lexer::Kind::NotEquals => 2,
         p4::lexer::Kind::Equals => 1,
@@ -886,6 +950,31 @@ fn token_relative(token: &p4::lexer::Token, content: &Rope) -> Option<(u32, u32,
         p4::lexer::Kind::Carat => 1,
         p4::lexer::Kind::GreaterThanEquals => 2,
         p4::lexer::Kind::LessThanEquals => 2,
+        p4::lexer::Kind::Shr => 2,
+        p4::lexer::Kind::Mul => 1,
+        p4::lexer::Kind::Div => 1,
+        p4::lexer::Kind::LogicalOr => 2,
+        p4::lexer::Kind::SaturatingAdd => 3,
+        p4::lexer::Kind::SaturatingSub => 3,
+        p4::lexer::Kind::PlusPlus => 2,
+        p4::lexer::Kind::Question => 1,
+        p4::lexer::Kind::ColonColon => 2,
+        p4::lexer::Kind::Abstract => 8,
+        p4::lexer::Kind::Default => 7,
+        p4::lexer::Kind::Enum => 4,
+        p4::lexer::Kind::Exit => 4,
+        p4::lexer::Kind::HeaderUnion => 12,
+        p4::lexer::Kind::List => 4,
+        p4::lexer::Kind::MatchKind => 10,
+        p4::lexer::Kind::Accept => 6,
+        p4::lexer::Kind::This => 4,
+        p4::lexer::Kind::Type => 4,
+        p4::lexer::Kind::ValueSet => 9,
+        p4::lexer::Kind::Verify => 6,
+        p4::lexer::Kind::Void => 4,
+        p4::lexer::Kind::Switch => 6,
+        p4::lexer::Kind::Reject => 6,
+        p4::lexer::Kind::Tuple => 5,
         _ => 1,
     };
 
