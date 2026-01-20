@@ -124,6 +124,16 @@ impl Backend {
 
         let lines: Vec<&str> = text.lines().collect();
 
+        let fallback_macros = match p4::preprocessor::run(text, filename.clone()) {
+            Ok(ppr) => ppr
+                .elements
+                .macros
+                .into_iter()
+                .map(|m| (m.name, m.body))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
         let (ast, diags, macros) = match self.compile_p4(text, filename.clone()) {
             Ok((ast, diags, macros)) => (Some(ast), diags, macros),
             Err(err) => {
@@ -149,7 +159,7 @@ impl Backend {
                         self.convert_p4_error(&e, &lines, &mut lsp_diagnostics);
                     }
                 }
-                (None, Diagnostics::new(), Vec::new())
+                (None, Diagnostics::new(), fallback_macros)
             }
         };
 
@@ -395,8 +405,13 @@ impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
@@ -435,7 +450,7 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let text = &params.text_document.text;
-        
+
         let doc = self.parse_document(&uri, text);
         let diagnostics = doc.diagnostics.clone();
         self.documents.insert(uri.clone(), doc);
@@ -488,6 +503,16 @@ impl LanguageServer for Backend {
                     range: None,
                 }));
             }
+
+            if let Some(builtin_hover) = analysis::get_builtin_hover(&doc.content, position) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: builtin_hover,
+                    }),
+                    range: None,
+                }));
+            }
         }
         Ok(None)
     }
@@ -501,6 +526,7 @@ impl LanguageServer for Backend {
                 let completions = analysis::get_completions_with_context(ast, &doc.content, position);
                 return Ok(Some(CompletionResponse::Array(completions)));
             }
+            return Ok(Some(CompletionResponse::Array(analysis::get_keyword_completions())));
         }
         Ok(None)
     }
@@ -763,7 +789,11 @@ impl Backend {
                 p4::lexer::Kind::GreaterThanEquals => (Some(SemanticTokenType::OPERATOR), 2),
                 p4::lexer::Kind::LessThanEquals => (Some(SemanticTokenType::OPERATOR), 2),
                 p4::lexer::Kind::Identifier(value) => {
-                    (Some(SemanticTokenType::VARIABLE), value.len() as u32)
+                    if let Some(token_type) = analysis::builtin_token_type_for_identifier(value) {
+                        (Some(token_type), value.len() as u32)
+                    } else {
+                        (Some(SemanticTokenType::VARIABLE), value.len() as u32)
+                    }
                 }
                 _ => (None, 1),
             };

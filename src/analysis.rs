@@ -3,6 +3,69 @@ use p4::lexer::Token;
 use ropey::Rope;
 use tower_lsp::lsp_types::*;
 
+fn builtin_semantic_token_type(name: &str) -> Option<SemanticTokenType> {
+    match name {
+        "NoAction" => Some(SemanticTokenType::FUNCTION),
+        "accept" | "reject" => Some(SemanticTokenType::KEYWORD),
+        "packet_in"
+        | "packet_out"
+        | "void"
+        | "tuple"
+        | "match_kind"
+        | "standard_metadata_t" => Some(SemanticTokenType::TYPE),
+        "standard_metadata" => Some(SemanticTokenType::VARIABLE),
+        "NoError"
+        | "PacketTooShort"
+        | "NoMatch"
+        | "StackOutOfBounds"
+        | "HeaderTooShort"
+        | "ParserTimeout" => Some(SemanticTokenType::VARIABLE),
+        _ => None,
+    }
+}
+
+fn builtin_hover(name: &str) -> Option<&'static str> {
+    match name {
+        "NoAction" => Some("```p4\naction NoAction()\n```\nBuilt-in action."),
+        "accept" => Some("```p4\naccept\n```\nBuilt-in parser state."),
+        "reject" => Some("```p4\nreject\n```\nBuilt-in parser state."),
+        "packet_in" => Some("```p4\npacket_in\n```\nBuilt-in type."),
+        "packet_out" => Some("```p4\npacket_out\n```\nBuilt-in type."),
+        "void" => Some("```p4\nvoid\n```\nBuilt-in type."),
+        "tuple" => Some("```p4\ntuple\n```\nBuilt-in type."),
+        "match_kind" => Some("```p4\nmatch_kind\n```\nBuilt-in type."),
+        "standard_metadata_t" => Some("```p4\nstandard_metadata_t\n```\nCommon built-in type (architecture-defined)."),
+        "standard_metadata" => Some("```p4\nstandard_metadata\n```\nCommon built-in variable (architecture-defined)."),
+        "NoError" => Some("```p4\nNoError\n```\nCommon built-in error member (core library)."),
+        "PacketTooShort" => Some("```p4\nPacketTooShort\n```\nCommon built-in error member (core library)."),
+        "NoMatch" => Some("```p4\nNoMatch\n```\nCommon built-in error member (core library)."),
+        "StackOutOfBounds" => Some("```p4\nStackOutOfBounds\n```\nCommon built-in error member (core library)."),
+        "HeaderTooShort" => Some("```p4\nHeaderTooShort\n```\nCommon built-in error member (core library)."),
+        "ParserTimeout" => Some("```p4\nParserTimeout\n```\nCommon built-in error member (core library)."),
+        _ => None,
+    }
+}
+
+pub fn get_builtin_hover(content: &Rope, position: Position) -> Option<String> {
+    let line_idx = position.line as usize;
+    let col_idx = position.character as usize;
+
+    if line_idx >= content.len_lines() {
+        return None;
+    }
+
+    let line = content.line(line_idx);
+    let line_str: String = line.chars().collect();
+    let (word, _) = extract_word_and_prefix(&line_str, col_idx);
+    let word = word?;
+
+    builtin_hover(&word).map(|s| s.to_string())
+}
+
+pub fn builtin_token_type_for_identifier(name: &str) -> Option<SemanticTokenType> {
+    builtin_semantic_token_type(name)
+}
+
 pub fn get_hover_info(ast: &AST, content: &Rope, position: Position) -> Option<String> {
     let line_idx = position.line as usize;
     let col_idx = position.character as usize;
@@ -306,7 +369,7 @@ fn get_member_hover(ast: &AST, ty: &Type, member_name: &str) -> Option<String> {
 
 pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
     let mut completions = Vec::new();
-    
+
     for header in &ast.headers {
         completions.push(CompletionItem {
             label: header.name.clone(),
@@ -315,7 +378,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             ..Default::default()
         });
     }
-    
+
     for s in &ast.structs {
         completions.push(CompletionItem {
             label: s.name.clone(),
@@ -324,7 +387,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             ..Default::default()
         });
     }
-    
+
     for control in &ast.controls {
         completions.push(CompletionItem {
             label: control.name.clone(),
@@ -332,7 +395,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             detail: Some("control".to_string()),
             ..Default::default()
         });
-        
+
         for action in &control.actions {
             completions.push(CompletionItem {
                 label: action.name.clone(),
@@ -341,7 +404,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
                 ..Default::default()
             });
         }
-        
+
         for table in &control.tables {
             completions.push(CompletionItem {
                 label: table.name.clone(),
@@ -351,7 +414,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             });
         }
     }
-    
+
     for parser in &ast.parsers {
         completions.push(CompletionItem {
             label: parser.name.clone(),
@@ -360,7 +423,7 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             ..Default::default()
         });
     }
-    
+
     for ext in &ast.externs {
         completions.push(CompletionItem {
             label: ext.name.clone(),
@@ -369,9 +432,9 @@ pub fn get_completions(ast: &AST) -> Vec<CompletionItem> {
             ..Default::default()
         });
     }
-    
+
     add_keyword_completions(&mut completions);
-    
+
     completions
 }
 
@@ -382,22 +445,22 @@ pub fn get_completions_with_context(
 ) -> Vec<CompletionItem> {
     let line_idx = position.line as usize;
     let col_idx = position.character as usize;
-    
+
     if line_idx >= content.len_lines() {
         return get_completions(ast);
     }
-    
+
     let line = content.line(line_idx);
     let line_str: String = line.chars().collect();
-    
+
     if let Some(prefix) = get_dot_prefix(&line_str, col_idx) {
         if let Some(ty) = resolve_type_for_name(ast, &prefix, content, position) {
             return get_member_completions(ast, &ty);
         }
     }
-    
+
     let mut completions = get_completions(ast);
-    
+
     if let Some((control, parser)) = find_enclosing_scope(ast, content, position) {
         if let Some(control) = control {
             for param in &control.parameters {
@@ -444,13 +507,13 @@ pub fn get_completions_with_context(
             }
         }
     }
-    
+
     completions
 }
 
 fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
     let mut completions = Vec::new();
-    
+
     match ty {
         Type::UserDefined(type_name) => {
             if let Some(s) = ast.get_struct(type_name) {
@@ -524,7 +587,7 @@ fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
         }
         _ => {}
     }
-    
+
     completions
 }
 
@@ -533,35 +596,35 @@ fn get_dot_prefix(line: &str, col: usize) -> Option<String> {
     if col == 0 || col > chars.len() {
         return None;
     }
-    
+
     let search_col = col.saturating_sub(1);
     if search_col >= chars.len() || chars[search_col] != '.' {
         return None;
     }
-    
+
     let end = search_col;
     let mut start = end;
     while start > 0 && is_identifier_char(chars[start - 1]) {
         start -= 1;
     }
-    
+
     if start == end {
         return None;
     }
-    
+
     Some(chars[start..end].iter().collect())
 }
 
 fn resolve_type_for_name(ast: &AST, name: &str, content: &Rope, position: Position) -> Option<Type> {
     let parts: Vec<&str> = name.split('.').collect();
     let base_name = parts[0];
-    
+
     let mut current_type = find_variable_type(ast, base_name, content, position)?;
-    
+
     for part in parts.iter().skip(1) {
         current_type = resolve_member_type(ast, &current_type, part)?;
     }
-    
+
     Some(current_type)
 }
 
@@ -615,7 +678,7 @@ fn find_variable_type(ast: &AST, name: &str, content: &Rope, position: Position)
             }
         }
     }
-    
+
     if let Some(s) = ast.get_struct(name) {
         return Some(Type::UserDefined(s.name.clone()));
     }
@@ -625,7 +688,7 @@ fn find_variable_type(ast: &AST, name: &str, content: &Rope, position: Position)
     if let Some(e) = ast.get_extern(name) {
         return Some(Type::UserDefined(e.name.clone()));
     }
-    
+
     None
 }
 
@@ -635,34 +698,34 @@ fn find_enclosing_scope<'a>(
     position: Position,
 ) -> Option<(Option<&'a Control>, Option<&'a Parser>)> {
     let target_line = position.line as usize;
-    
+
     for control in &ast.controls {
         if is_position_in_control(control, content, target_line) {
             return Some((Some(control), None));
         }
     }
-    
+
     for parser in &ast.parsers {
         if is_position_in_parser(parser, content, target_line) {
             return Some((None, Some(parser)));
         }
     }
-    
+
     None
 }
 
 fn is_position_in_control(control: &Control, content: &Rope, target_line: usize) -> bool {
     let content_str: String = content.chars().collect();
     let control_pattern = format!("control {}", control.name);
-    
+
     if let Some(start_pos) = content_str.find(&control_pattern) {
         let start_line = content_str[..start_pos].matches('\n').count();
-        
+
         let remaining = &content_str[start_pos..];
         let mut brace_count = 0;
         let mut end_line = start_line;
         let mut found_open = false;
-        
+
         for c in remaining.chars() {
             if c == '{' {
                 brace_count += 1;
@@ -676,25 +739,25 @@ fn is_position_in_control(control: &Control, content: &Rope, target_line: usize)
                 end_line += 1;
             }
         }
-        
+
         return target_line >= start_line && target_line <= end_line;
     }
-    
+
     false
 }
 
 fn is_position_in_parser(parser: &Parser, content: &Rope, target_line: usize) -> bool {
     let content_str: String = content.chars().collect();
     let parser_pattern = format!("parser {}", parser.name);
-    
+
     if let Some(start_pos) = content_str.find(&parser_pattern) {
         let start_line = content_str[..start_pos].matches('\n').count();
-        
+
         let remaining = &content_str[start_pos..];
         let mut brace_count = 0;
         let mut end_line = start_line;
         let mut found_open = false;
-        
+
         for c in remaining.chars() {
             if c == '{' {
                 brace_count += 1;
@@ -708,36 +771,48 @@ fn is_position_in_parser(parser: &Parser, content: &Rope, target_line: usize) ->
                 end_line += 1;
             }
         }
-        
+
         return target_line >= start_line && target_line <= end_line;
     }
-    
+
     false
 }
 
 pub fn extract_word_and_prefix(line: &str, col: usize) -> (Option<String>, Option<String>) {
     let chars: Vec<char> = line.chars().collect();
-    
-    if col >= chars.len() {
+
+    if chars.is_empty() {
         return (None, None);
     }
-    
-    let mut end = col;
-    while end < chars.len() && is_identifier_char(chars[end]) {
-        end += 1;
+
+    // VSCode frequently sends positions that sit *between* characters (e.g. at the end of an
+    // identifier). Make a best-effort attempt to snap the column onto a nearby identifier.
+    let mut idx = col;
+    if idx >= chars.len() {
+        idx = chars.len() - 1;
     }
-    
-    let mut start = col;
+    if !is_identifier_char(chars[idx]) {
+        if idx > 0 && is_identifier_char(chars[idx - 1]) {
+            idx -= 1;
+        } else if idx + 1 < chars.len() && is_identifier_char(chars[idx + 1]) {
+            idx += 1;
+        } else {
+            return (None, None);
+        }
+    }
+
+    let mut start = idx;
     while start > 0 && is_identifier_char(chars[start - 1]) {
         start -= 1;
     }
-    
-    if start == end {
-        return (None, None);
+
+    let mut end = idx + 1;
+    while end < chars.len() && is_identifier_char(chars[end]) {
+        end += 1;
     }
-    
+
     let word: String = chars[start..end].iter().collect();
-    
+
     let mut prefix = None;
     if start > 0 && chars[start - 1] == '.' {
         let prefix_end = start - 1;
@@ -749,7 +824,7 @@ pub fn extract_word_and_prefix(line: &str, col: usize) -> (Option<String>, Optio
             prefix = Some(chars[prefix_start..prefix_end].iter().collect());
         }
     }
-    
+
     (Some(word), prefix)
 }
 
@@ -846,7 +921,7 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
         ("transition", "Parser state transition"),
         ("typedef", "Type definition"),
     ];
-    
+
     for (kw, doc) in keywords {
         completions.push(CompletionItem {
             label: kw.to_string(),
@@ -855,7 +930,7 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
             ..Default::default()
         });
     }
-    
+
     let types = ["bit", "bool", "error", "int", "varbit"];
     for ty in types {
         completions.push(CompletionItem {
@@ -865,4 +940,39 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
             ..Default::default()
         });
     }
+
+    let builtins = [
+        ("NoAction", CompletionItemKind::FUNCTION, "Built-in action"),
+        ("accept", CompletionItemKind::KEYWORD, "Built-in parser state"),
+        ("reject", CompletionItemKind::KEYWORD, "Built-in parser state"),
+        ("packet_in", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("packet_out", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("void", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("tuple", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("match_kind", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("string", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
+        ("NoError", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("PacketTooShort", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("NoMatch", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("StackOutOfBounds", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("HeaderTooShort", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("ParserTimeout", CompletionItemKind::CONSTANT, "Common built-in error member"),
+        ("standard_metadata_t", CompletionItemKind::TYPE_PARAMETER, "Common architecture type"),
+        ("standard_metadata", CompletionItemKind::VARIABLE, "Common architecture variable"),
+    ];
+
+    for (label, kind, detail) in builtins {
+        completions.push(CompletionItem {
+            label: label.to_string(),
+            kind: Some(kind),
+            detail: Some(detail.to_string()),
+            ..Default::default()
+        });
+    }
+}
+
+pub fn get_keyword_completions() -> Vec<CompletionItem> {
+    let mut completions = Vec::new();
+    add_keyword_completions(&mut completions);
+    completions
 }
