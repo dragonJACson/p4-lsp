@@ -1,5 +1,5 @@
-use p4::ast::{AST, Control, Header, Parser, Struct, Extern, Action, Direction, Type};
 use p4::ast::Typedef;
+use p4::ast::{Action, Control, Direction, Extern, Header, Parser, Struct, Type, AST};
 use p4::lexer::Token;
 use ropey::Rope;
 use tower_lsp::lsp_types::*;
@@ -49,7 +49,9 @@ fn builtin_semantic_token_type(name: &str) -> Option<SemanticTokenType> {
 
         // v1model architecture: types
         "standard_metadata_t" => Some(SemanticTokenType::STRUCT),
-        "CounterType" | "MeterType" | "CloneType" | "HashAlgorithm" => Some(SemanticTokenType::TYPE),
+        "CounterType" | "MeterType" | "CloneType" | "HashAlgorithm" => {
+            Some(SemanticTokenType::TYPE)
+        }
 
         // v1model architecture: variables
         "standard_metadata" => Some(SemanticTokenType::VARIABLE),
@@ -58,24 +60,11 @@ fn builtin_semantic_token_type(name: &str) -> Option<SemanticTokenType> {
         "packets" | "bytes" | "packets_and_bytes" => Some(SemanticTokenType::ENUM_MEMBER),
 
         // v1model architecture: externs
-        "counter"
-        | "direct_counter"
-        | "meter"
-        | "direct_meter"
-        | "register"
-        | "action_profile"
-        | "action_selector"
-        | "Checksum16"
-        | "random"
-        | "digest"
-        | "resubmit"
-        | "recirculate"
-        | "clone"
-        | "clone3"
-        | "truncate"
-        | "hash"
-        | "mark_to_drop"
-        | "log_msg" => Some(SemanticTokenType::FUNCTION),
+        "counter" | "direct_counter" | "meter" | "direct_meter" | "register" | "action_profile"
+        | "action_selector" | "Checksum16" | "random" | "digest" | "resubmit" | "recirculate"
+        | "clone" | "clone3" | "truncate" | "hash" | "mark_to_drop" | "log_msg" => {
+            Some(SemanticTokenType::FUNCTION)
+        }
 
         _ => None,
     }
@@ -293,11 +282,7 @@ fn format_scoped_name_info(info: &p4::ast::NameInfo, name: &str) -> String {
     }
 }
 
-pub fn get_definition_location(
-    ast: &AST,
-    content: &Rope,
-    position: Position,
-) -> Option<Location> {
+pub fn get_definition_location(ast: &AST, content: &Rope, position: Position) -> Option<Location> {
     let line_idx = position.line as usize;
     let col_idx = position.character as usize;
 
@@ -346,7 +331,10 @@ fn resolve_member_token(ast: &AST, ty: &Type, member_name: &str) -> Option<Token
                         return Some(m.token.clone());
                     }
                 }
-                if member_name == "isValid" || member_name == "setValid" || member_name == "setInvalid" {
+                if member_name == "isValid"
+                    || member_name == "setValid"
+                    || member_name == "setInvalid"
+                {
                     return Some(h.token.clone());
                 }
             }
@@ -465,27 +453,46 @@ fn get_member_hover(ast: &AST, ty: &Type, member_name: &str) -> Option<String> {
             if let Some(s) = ast.get_struct(type_name) {
                 for m in &s.members {
                     if m.name == member_name {
-                        return Some(format!("```p4\n{} {}.{}\n```\nMember of struct `{}`", m.ty, type_name, m.name, type_name));
+                        return Some(format!(
+                            "```p4\n{} {}.{}\n```\nMember of struct `{}`",
+                            m.ty, type_name, m.name, type_name
+                        ));
                     }
                 }
             }
             if let Some(h) = ast.get_header(type_name) {
                 for m in &h.members {
                     if m.name == member_name {
-                        return Some(format!("```p4\n{} {}.{}\n```\nMember of header `{}`", m.ty, type_name, m.name, type_name));
+                        return Some(format!(
+                            "```p4\n{} {}.{}\n```\nMember of header `{}`",
+                            m.ty, type_name, m.name, type_name
+                        ));
                     }
                 }
-                if member_name == "isValid" || member_name == "setValid" || member_name == "setInvalid" {
+                if member_name == "isValid"
+                    || member_name == "setValid"
+                    || member_name == "setInvalid"
+                {
                     return Some(format!("```p4\n{}()\n```\nHeader method", member_name));
                 }
             }
             if let Some(e) = ast.get_extern(type_name) {
                 for m in &e.methods {
                     if m.name == member_name {
-                        let params: Vec<String> = m.parameters.iter()
-                            .map(|p| format!("{} {} {}", format_direction(&p.direction), p.ty, p.name))
+                        let params: Vec<String> = m
+                            .parameters
+                            .iter()
+                            .map(|p| {
+                                format!("{} {} {}", format_direction(&p.direction), p.ty, p.name)
+                            })
                             .collect();
-                        return Some(format!("```p4\n{} {}({})\n```\nMethod of extern `{}`", m.return_type, m.name, params.join(", "), type_name));
+                        return Some(format!(
+                            "```p4\n{} {}({})\n```\nMethod of extern `{}`",
+                            m.return_type,
+                            m.name,
+                            params.join(", "),
+                            type_name
+                        ));
                     }
                 }
             }
@@ -650,7 +657,10 @@ fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
                         label: member.name.clone(),
                         kind: Some(CompletionItemKind::FIELD),
                         detail: Some(format!("{}", member.ty)),
-                        documentation: Some(Documentation::String(format!("Member of struct {}", type_name))),
+                        documentation: Some(Documentation::String(format!(
+                            "Member of struct {}",
+                            type_name
+                        ))),
                         ..Default::default()
                     });
                 }
@@ -661,7 +671,10 @@ fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
                         label: member.name.clone(),
                         kind: Some(CompletionItemKind::FIELD),
                         detail: Some(format!("{}", member.ty)),
-                        documentation: Some(Documentation::String(format!("Member of header {}", type_name))),
+                        documentation: Some(Documentation::String(format!(
+                            "Member of header {}",
+                            type_name
+                        ))),
                         ..Default::default()
                     });
                 }
@@ -670,7 +683,9 @@ fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
                     kind: Some(CompletionItemKind::METHOD),
                     detail: Some("bool".to_string()),
                     insert_text: Some("isValid()".to_string()),
-                    documentation: Some(Documentation::String("Check if header is valid".to_string())),
+                    documentation: Some(Documentation::String(
+                        "Check if header is valid".to_string(),
+                    )),
                     ..Default::default()
                 });
                 completions.push(CompletionItem {
@@ -686,13 +701,17 @@ fn get_member_completions(ast: &AST, ty: &Type) -> Vec<CompletionItem> {
                     kind: Some(CompletionItemKind::METHOD),
                     detail: Some("void".to_string()),
                     insert_text: Some("setInvalid()".to_string()),
-                    documentation: Some(Documentation::String("Mark header as invalid".to_string())),
+                    documentation: Some(Documentation::String(
+                        "Mark header as invalid".to_string(),
+                    )),
                     ..Default::default()
                 });
             }
             if let Some(e) = ast.get_extern(type_name) {
                 for method in &e.methods {
-                    let params: Vec<String> = method.parameters.iter()
+                    let params: Vec<String> = method
+                        .parameters
+                        .iter()
                         .map(|p| format!("{} {}", p.ty, p.name))
                         .collect();
                     completions.push(CompletionItem {
@@ -743,7 +762,12 @@ fn get_dot_prefix(line: &str, col: usize) -> Option<String> {
     Some(chars[start..end].iter().collect())
 }
 
-fn resolve_type_for_name(ast: &AST, name: &str, content: &Rope, position: Position) -> Option<Type> {
+fn resolve_type_for_name(
+    ast: &AST,
+    name: &str,
+    content: &Rope,
+    position: Position,
+) -> Option<Type> {
     let parts: Vec<&str> = name.split('.').collect();
     let base_name = parts[0];
 
@@ -945,7 +969,9 @@ pub fn extract_word_and_prefix(line: &str, col: usize) -> (Option<String>, Optio
     if start > 0 && chars[start - 1] == '.' {
         let prefix_end = start - 1;
         let mut prefix_start = prefix_end;
-        while prefix_start > 0 && (is_identifier_char(chars[prefix_start - 1]) || chars[prefix_start - 1] == '.') {
+        while prefix_start > 0
+            && (is_identifier_char(chars[prefix_start - 1]) || chars[prefix_start - 1] == '.')
+        {
             prefix_start -= 1;
         }
         if prefix_start < prefix_end {
@@ -988,14 +1014,22 @@ fn format_struct_hover(s: &Struct) -> String {
 }
 
 fn format_control_hover(control: &Control) -> String {
-    let params: Vec<String> = control.parameters.iter()
+    let params: Vec<String> = control
+        .parameters
+        .iter()
         .map(|p| format!("{} {} {}", format_direction(&p.direction), p.ty, p.name))
         .collect();
-    format!("```p4\ncontrol {}({})\n```", control.name, params.join(", "))
+    format!(
+        "```p4\ncontrol {}({})\n```",
+        control.name,
+        params.join(", ")
+    )
 }
 
 fn format_parser_hover(parser: &Parser) -> String {
-    let params: Vec<String> = parser.parameters.iter()
+    let params: Vec<String> = parser
+        .parameters
+        .iter()
         .map(|p| format!("{} {} {}", format_direction(&p.direction), p.ty, p.name))
         .collect();
     format!("```p4\nparser {}({})\n```", parser.name, params.join(", "))
@@ -1004,24 +1038,42 @@ fn format_parser_hover(parser: &Parser) -> String {
 fn format_extern_hover(ext: &Extern) -> String {
     let mut result = format!("```p4\nextern {} {{\n", ext.name);
     for method in &ext.methods {
-        let params: Vec<String> = method.parameters.iter()
+        let params: Vec<String> = method
+            .parameters
+            .iter()
             .map(|p| format!("{} {} {}", format_direction(&p.direction), p.ty, p.name))
             .collect();
-        result.push_str(&format!("    {} {}({});\n", method.return_type, method.name, params.join(", ")));
+        result.push_str(&format!(
+            "    {} {}({});\n",
+            method.return_type,
+            method.name,
+            params.join(", ")
+        ));
     }
     result.push_str("}\n```");
     result
 }
 
 fn format_action_hover(action: &Action, control_name: &str) -> String {
-    let params: Vec<String> = action.parameters.iter()
+    let params: Vec<String> = action
+        .parameters
+        .iter()
         .map(|p| format!("{} {} {}", format_direction(&p.direction), p.ty, p.name))
         .collect();
-    format!("```p4\n// in control {}\naction {}({})\n```", control_name, action.name, params.join(", "))
+    format!(
+        "```p4\n// in control {}\naction {}({})\n```",
+        control_name,
+        action.name,
+        params.join(", ")
+    )
 }
 
 fn format_typedef_hover(ast: &AST, td: &Typedef) -> String {
-    let mut result = format!("```p4\ntypedef {} {}\n```", format_type_alias(ast, &td.ty), td.name);
+    let mut result = format!(
+        "```p4\ntypedef {} {}\n```",
+        format_type_alias(ast, &td.ty),
+        td.name
+    );
     if let Type::UserDefined(name) = &td.ty {
         if let Some(header) = ast.get_header(&name) {
             result.push_str("\n\n");
@@ -1112,84 +1164,271 @@ fn add_keyword_completions(completions: &mut Vec<CompletionItem>) {
 
     let builtins = [
         // Core library: actions
-        ("NoAction", CompletionItemKind::FUNCTION, "Built-in action (core.p4)"),
-
+        (
+            "NoAction",
+            CompletionItemKind::FUNCTION,
+            "Built-in action (core.p4)",
+        ),
         // Core library: parser states
-        ("accept", CompletionItemKind::KEYWORD, "Built-in parser state"),
-        ("reject", CompletionItemKind::KEYWORD, "Built-in parser state"),
-
+        (
+            "accept",
+            CompletionItemKind::KEYWORD,
+            "Built-in parser state",
+        ),
+        (
+            "reject",
+            CompletionItemKind::KEYWORD,
+            "Built-in parser state",
+        ),
         // Core library: extern types
-        ("packet_in", CompletionItemKind::CLASS, "Extern for incoming packets (core.p4)"),
-        ("packet_out", CompletionItemKind::CLASS, "Extern for outgoing packets (core.p4)"),
-
+        (
+            "packet_in",
+            CompletionItemKind::CLASS,
+            "Extern for incoming packets (core.p4)",
+        ),
+        (
+            "packet_out",
+            CompletionItemKind::CLASS,
+            "Extern for outgoing packets (core.p4)",
+        ),
         // Core library: types
         ("void", CompletionItemKind::TYPE_PARAMETER, "Built-in type"),
-        ("tuple", CompletionItemKind::TYPE_PARAMETER, "Built-in tuple type"),
-        ("match_kind", CompletionItemKind::TYPE_PARAMETER, "Built-in type for match kinds"),
-        ("string", CompletionItemKind::TYPE_PARAMETER, "Built-in string type"),
-
+        (
+            "tuple",
+            CompletionItemKind::TYPE_PARAMETER,
+            "Built-in tuple type",
+        ),
+        (
+            "match_kind",
+            CompletionItemKind::TYPE_PARAMETER,
+            "Built-in type for match kinds",
+        ),
+        (
+            "string",
+            CompletionItemKind::TYPE_PARAMETER,
+            "Built-in string type",
+        ),
         // Core library: error members
-        ("NoError", CompletionItemKind::ENUM_MEMBER, "No error (core.p4)"),
-        ("PacketTooShort", CompletionItemKind::ENUM_MEMBER, "Not enough bits in packet (core.p4)"),
-        ("NoMatch", CompletionItemKind::ENUM_MEMBER, "No match in select (core.p4)"),
-        ("StackOutOfBounds", CompletionItemKind::ENUM_MEMBER, "Invalid stack element (core.p4)"),
-        ("HeaderTooShort", CompletionItemKind::ENUM_MEMBER, "Varbit extraction overflow (core.p4)"),
-        ("ParserTimeout", CompletionItemKind::ENUM_MEMBER, "Parser timeout (core.p4)"),
-        ("ParserInvalidArgument", CompletionItemKind::ENUM_MEMBER, "Invalid parser argument (core.p4)"),
-
+        (
+            "NoError",
+            CompletionItemKind::ENUM_MEMBER,
+            "No error (core.p4)",
+        ),
+        (
+            "PacketTooShort",
+            CompletionItemKind::ENUM_MEMBER,
+            "Not enough bits in packet (core.p4)",
+        ),
+        (
+            "NoMatch",
+            CompletionItemKind::ENUM_MEMBER,
+            "No match in select (core.p4)",
+        ),
+        (
+            "StackOutOfBounds",
+            CompletionItemKind::ENUM_MEMBER,
+            "Invalid stack element (core.p4)",
+        ),
+        (
+            "HeaderTooShort",
+            CompletionItemKind::ENUM_MEMBER,
+            "Varbit extraction overflow (core.p4)",
+        ),
+        (
+            "ParserTimeout",
+            CompletionItemKind::ENUM_MEMBER,
+            "Parser timeout (core.p4)",
+        ),
+        (
+            "ParserInvalidArgument",
+            CompletionItemKind::ENUM_MEMBER,
+            "Invalid parser argument (core.p4)",
+        ),
         // Core library: packet_in methods
-        ("extract", CompletionItemKind::METHOD, "Extract header from packet (core.p4)"),
-        ("lookahead", CompletionItemKind::METHOD, "Peek at packet bits (core.p4)"),
-        ("advance", CompletionItemKind::METHOD, "Advance packet cursor (core.p4)"),
-
+        (
+            "extract",
+            CompletionItemKind::METHOD,
+            "Extract header from packet (core.p4)",
+        ),
+        (
+            "lookahead",
+            CompletionItemKind::METHOD,
+            "Peek at packet bits (core.p4)",
+        ),
+        (
+            "advance",
+            CompletionItemKind::METHOD,
+            "Advance packet cursor (core.p4)",
+        ),
         // Core library: packet_out methods
-        ("emit", CompletionItemKind::METHOD, "Emit header to packet (core.p4)"),
-
+        (
+            "emit",
+            CompletionItemKind::METHOD,
+            "Emit header to packet (core.p4)",
+        ),
         // Core library: header methods
-        ("isValid", CompletionItemKind::METHOD, "Check if header is valid"),
-        ("setValid", CompletionItemKind::METHOD, "Mark header as valid"),
-        ("setInvalid", CompletionItemKind::METHOD, "Mark header as invalid"),
-
+        (
+            "isValid",
+            CompletionItemKind::METHOD,
+            "Check if header is valid",
+        ),
+        (
+            "setValid",
+            CompletionItemKind::METHOD,
+            "Mark header as valid",
+        ),
+        (
+            "setInvalid",
+            CompletionItemKind::METHOD,
+            "Mark header as invalid",
+        ),
         // Core library: functions
-        ("static_assert", CompletionItemKind::FUNCTION, "Compile-time assertion (core.p4)"),
-
+        (
+            "static_assert",
+            CompletionItemKind::FUNCTION,
+            "Compile-time assertion (core.p4)",
+        ),
         // v1model architecture: types
-        ("standard_metadata_t", CompletionItemKind::STRUCT, "Standard metadata structure (v1model)"),
-        ("standard_metadata", CompletionItemKind::VARIABLE, "Standard metadata variable (v1model)"),
-        ("CounterType", CompletionItemKind::ENUM, "Counter type enum (v1model)"),
-        ("MeterType", CompletionItemKind::ENUM, "Meter type enum (v1model)"),
-        ("HashAlgorithm", CompletionItemKind::ENUM, "Hash algorithm enum (v1model)"),
-        ("CloneType", CompletionItemKind::ENUM, "Clone type enum (v1model)"),
-
+        (
+            "standard_metadata_t",
+            CompletionItemKind::STRUCT,
+            "Standard metadata structure (v1model)",
+        ),
+        (
+            "standard_metadata",
+            CompletionItemKind::VARIABLE,
+            "Standard metadata variable (v1model)",
+        ),
+        (
+            "CounterType",
+            CompletionItemKind::ENUM,
+            "Counter type enum (v1model)",
+        ),
+        (
+            "MeterType",
+            CompletionItemKind::ENUM,
+            "Meter type enum (v1model)",
+        ),
+        (
+            "HashAlgorithm",
+            CompletionItemKind::ENUM,
+            "Hash algorithm enum (v1model)",
+        ),
+        (
+            "CloneType",
+            CompletionItemKind::ENUM,
+            "Clone type enum (v1model)",
+        ),
         // v1model architecture: match_kind extensions
-        ("optional", CompletionItemKind::ENUM_MEMBER, "Optional match kind (v1model)"),
-        ("selector", CompletionItemKind::ENUM_MEMBER, "Selector match kind (v1model)"),
-
+        (
+            "optional",
+            CompletionItemKind::ENUM_MEMBER,
+            "Optional match kind (v1model)",
+        ),
+        (
+            "selector",
+            CompletionItemKind::ENUM_MEMBER,
+            "Selector match kind (v1model)",
+        ),
         // v1model architecture: enum values
-        ("packets", CompletionItemKind::ENUM_MEMBER, "Count packets (v1model)"),
-        ("bytes", CompletionItemKind::ENUM_MEMBER, "Count bytes (v1model)"),
-        ("packets_and_bytes", CompletionItemKind::ENUM_MEMBER, "Count both (v1model)"),
-
+        (
+            "packets",
+            CompletionItemKind::ENUM_MEMBER,
+            "Count packets (v1model)",
+        ),
+        (
+            "bytes",
+            CompletionItemKind::ENUM_MEMBER,
+            "Count bytes (v1model)",
+        ),
+        (
+            "packets_and_bytes",
+            CompletionItemKind::ENUM_MEMBER,
+            "Count both (v1model)",
+        ),
         // v1model architecture: externs
-        ("counter", CompletionItemKind::CLASS, "Counter extern (v1model)"),
-        ("direct_counter", CompletionItemKind::CLASS, "Direct counter extern (v1model)"),
+        (
+            "counter",
+            CompletionItemKind::CLASS,
+            "Counter extern (v1model)",
+        ),
+        (
+            "direct_counter",
+            CompletionItemKind::CLASS,
+            "Direct counter extern (v1model)",
+        ),
         ("meter", CompletionItemKind::CLASS, "Meter extern (v1model)"),
-        ("direct_meter", CompletionItemKind::CLASS, "Direct meter extern (v1model)"),
-        ("register", CompletionItemKind::CLASS, "Register extern (v1model)"),
-        ("action_profile", CompletionItemKind::CLASS, "Action profile extern (v1model)"),
-        ("action_selector", CompletionItemKind::CLASS, "Action selector extern (v1model)"),
-
+        (
+            "direct_meter",
+            CompletionItemKind::CLASS,
+            "Direct meter extern (v1model)",
+        ),
+        (
+            "register",
+            CompletionItemKind::CLASS,
+            "Register extern (v1model)",
+        ),
+        (
+            "action_profile",
+            CompletionItemKind::CLASS,
+            "Action profile extern (v1model)",
+        ),
+        (
+            "action_selector",
+            CompletionItemKind::CLASS,
+            "Action selector extern (v1model)",
+        ),
         // v1model architecture: functions
-        ("mark_to_drop", CompletionItemKind::FUNCTION, "Mark packet to drop (v1model)"),
-        ("hash", CompletionItemKind::FUNCTION, "Compute hash (v1model)"),
-        ("random", CompletionItemKind::FUNCTION, "Generate random number (v1model)"),
-        ("digest", CompletionItemKind::FUNCTION, "Send digest to control plane (v1model)"),
-        ("resubmit", CompletionItemKind::FUNCTION, "Resubmit packet (v1model)"),
-        ("recirculate", CompletionItemKind::FUNCTION, "Recirculate packet (v1model)"),
-        ("clone", CompletionItemKind::FUNCTION, "Clone packet (v1model)"),
-        ("clone3", CompletionItemKind::FUNCTION, "Clone packet with metadata (v1model)"),
-        ("truncate", CompletionItemKind::FUNCTION, "Truncate packet (v1model)"),
-        ("log_msg", CompletionItemKind::FUNCTION, "Log debug message (v1model)"),
+        (
+            "mark_to_drop",
+            CompletionItemKind::FUNCTION,
+            "Mark packet to drop (v1model)",
+        ),
+        (
+            "hash",
+            CompletionItemKind::FUNCTION,
+            "Compute hash (v1model)",
+        ),
+        (
+            "random",
+            CompletionItemKind::FUNCTION,
+            "Generate random number (v1model)",
+        ),
+        (
+            "digest",
+            CompletionItemKind::FUNCTION,
+            "Send digest to control plane (v1model)",
+        ),
+        (
+            "resubmit",
+            CompletionItemKind::FUNCTION,
+            "Resubmit packet (v1model)",
+        ),
+        (
+            "recirculate",
+            CompletionItemKind::FUNCTION,
+            "Recirculate packet (v1model)",
+        ),
+        (
+            "clone",
+            CompletionItemKind::FUNCTION,
+            "Clone packet (v1model)",
+        ),
+        (
+            "clone3",
+            CompletionItemKind::FUNCTION,
+            "Clone packet with metadata (v1model)",
+        ),
+        (
+            "truncate",
+            CompletionItemKind::FUNCTION,
+            "Truncate packet (v1model)",
+        ),
+        (
+            "log_msg",
+            CompletionItemKind::FUNCTION,
+            "Log debug message (v1model)",
+        ),
     ];
 
     for (label, kind, detail) in builtins {

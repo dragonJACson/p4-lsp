@@ -4,7 +4,7 @@ use ropey::Rope;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -14,9 +14,13 @@ use p4::check::{self, Diagnostics, Level};
 use p4::error::{Error, PreprocessorError};
 use p4::lexer::Lexer;
 use p4::parser::Parser;
+use p4::preprocessor::MacroEnv;
 use tower_lsp::lsp_types::SemanticTokenType;
 
 mod analysis;
+mod project;
+
+use project::{FilePath, ProjectState, SymbolKind};
 
 #[derive(Debug)]
 struct Document {
@@ -31,6 +35,7 @@ struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
     semantic_tokens: SemanticTokensLegend,
+    project: RwLock<ProjectState>,
 }
 
 struct SemanticTokensBuilder {
@@ -111,6 +116,7 @@ impl Backend {
                 SemanticTokenType::CLASS,
                 SemanticTokenType::STRUCT,
                 SemanticTokenType::ENUM,
+                SemanticTokenType::TYPE_PARAMETER,
             ],
             token_modifiers: Vec::new(),
         };
@@ -119,7 +125,42 @@ impl Backend {
             client,
             documents: DashMap::new(),
             semantic_tokens,
+            project: RwLock::new(ProjectState::new()),
         }
+    }
+
+    fn get_visible_symbols(&self, file_path: &FilePath) -> Vec<String> {
+        let project = self.project.read().unwrap();
+
+        if let Some(root_path) = project.find_root_for_file(file_path) {
+            if let Some(unit) = project.roots.get(&root_path) {
+                return unit
+                    .symbols_visible_at(file_path)
+                    .into_iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+            }
+        }
+
+        Vec::new()
+    }
+
+    fn get_symbol_kinds(
+        &self,
+        file_path: &FilePath,
+    ) -> std::collections::HashMap<String, SymbolKind> {
+        let project = self.project.read().unwrap();
+        let mut result = std::collections::HashMap::new();
+
+        if let Some(root_path) = project.find_root_for_file(file_path) {
+            if let Some(unit) = project.roots.get(&root_path) {
+                for sym in unit.symbols_visible_at(file_path) {
+                    result.insert(sym.name.clone(), sym.kind);
+                }
+            }
+        }
+
+        result
     }
 
     fn parse_document(&self, uri: &Url, text: &str) -> Document {
@@ -152,7 +193,10 @@ impl Backend {
                                 },
                                 end: Position {
                                     line: e.line as u32,
-                                    character: lines.get(e.line).map(|l| l.len() as u32).unwrap_or(0),
+                                    character: lines
+                                        .get(e.line)
+                                        .map(|l| l.len() as u32)
+                                        .unwrap_or(0),
                                 },
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
@@ -212,26 +256,34 @@ impl Backend {
     ) -> std::result::Result<(AST, Diagnostics, Vec<(String, String)>), CompileError> {
         let mut ast = AST::default();
         let mut macros = Vec::new();
-        self.process_file_content(text, filename, &mut ast, &mut macros)?;
+        let env_in = MacroEnv::default();
+        self.process_file_content(text, filename, &mut ast, &mut macros, &env_in)?;
 
         let (_, diags) = check::all(&ast);
         Ok((ast, diags, macros))
     }
 
+    /// Process a file and its includes, propagating macros through the include chain.
+    /// Returns the macro environment after processing this file and all its includes.
     fn process_file_content(
         &self,
         text: &str,
         filename: Arc<String>,
         ast: &mut AST,
         macros: &mut Vec<(String, String)>,
-    ) -> std::result::Result<(), CompileError> {
-        let ppr = p4::preprocessor::run(text, filename.clone())
+        env_in: &MacroEnv,
+    ) -> std::result::Result<MacroEnv, CompileError> {
+        let ppr = p4::preprocessor::run_with_env(text, filename.clone(), env_in)
             .map_err(CompileError::Preprocessor)?;
 
         for m in &ppr.elements.macros {
             macros.push((m.name.clone(), m.body.clone()));
         }
 
+        // Start with the environment after preprocessing this file
+        let mut current_env = ppr.env_out.clone();
+
+        // Process includes in order, propagating macros from each to the next
         for included in &ppr.elements.includes {
             let path = Path::new(included);
             let include_path = if !path.is_absolute() {
@@ -243,7 +295,14 @@ impl Backend {
 
             if let Ok(include_content) = fs::read_to_string(&include_path) {
                 let include_filename = Arc::new(include_path.to_string_lossy().to_string());
-                self.process_file_content(&include_content, include_filename, ast, macros)?;
+                // Pass current_env to the included file, and update it with the result
+                current_env = self.process_file_content(
+                    &include_content,
+                    include_filename,
+                    ast,
+                    macros,
+                    &current_env,
+                )?;
             }
         }
 
@@ -251,10 +310,15 @@ impl Backend {
         let mut parser = Parser::new(lexer);
         parser.run(ast).map_err(CompileError::P4)?;
 
-        Ok(())
+        Ok(current_env)
     }
 
-    fn convert_p4_error(&self, error: &Error, lines: &[&str], lsp_diagnostics: &mut Vec<Diagnostic>) {
+    fn convert_p4_error(
+        &self,
+        error: &Error,
+        lines: &[&str],
+        lsp_diagnostics: &mut Vec<Diagnostic>,
+    ) {
         match error {
             Error::Lexer(e) => {
                 lsp_diagnostics.push(Diagnostic {
@@ -282,7 +346,10 @@ impl Backend {
                         },
                         end: Position {
                             line: e.at.line as u32,
-                            character: lines.get(e.at.line).map(|l| l.len() as u32).unwrap_or(e.at.col as u32 + 1),
+                            character: lines
+                                .get(e.at.line)
+                                .map(|l| l.len() as u32)
+                                .unwrap_or(e.at.col as u32 + 1),
                         },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -300,7 +367,10 @@ impl Backend {
                             },
                             end: Position {
                                 line: e.at.line as u32,
-                                character: lines.get(e.at.line).map(|l| l.len() as u32).unwrap_or(e.at.col as u32 + 1),
+                                character: lines
+                                    .get(e.at.line)
+                                    .map(|l| l.len() as u32)
+                                    .unwrap_or(e.at.col as u32 + 1),
                             },
                         },
                         severity: Some(DiagnosticSeverity::ERROR),
@@ -338,11 +408,7 @@ impl Backend {
         None
     }
 
-    fn get_include_location(
-        &self,
-        doc: &Document,
-        position: Position,
-    ) -> Option<Location> {
+    fn get_include_location(&self, doc: &Document, position: Position) -> Option<Location> {
         let line_idx = position.line as usize;
         if line_idx >= doc.content.len_lines() {
             return None;
@@ -398,8 +464,6 @@ fn resolve_include_path(current_file: &str, include: &str) -> Option<String> {
     Some(parent.join(include).to_string_lossy().to_string())
 }
 
-
-
 enum CompileError {
     Preprocessor(PreprocessorError),
     P4(Error),
@@ -407,7 +471,21 @@ enum CompileError {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if let Some(root_uri) = params.root_uri {
+            if let Ok(path) = root_uri.to_file_path() {
+                let mut project = self.project.write().unwrap();
+                project.set_workspace_root(path);
+            }
+        } else if let Some(folders) = params.workspace_folders {
+            if let Some(folder) = folders.first() {
+                if let Ok(path) = folder.uri.to_file_path() {
+                    let mut project = self.project.write().unwrap();
+                    project.set_workspace_root(path);
+                }
+            }
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -424,14 +502,16 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
-                semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
-                    SemanticTokensOptions {
-                        legend: self.semantic_tokens.clone(),
-                        range: Some(true),
-                        full: Some(SemanticTokensFullOptions::Bool(true)),
-                        ..Default::default()
-                    },
-                )),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: self.semantic_tokens.clone(),
+                            range: Some(true),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            ..Default::default()
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -443,6 +523,12 @@ impl LanguageServer for Backend {
 
     async fn initialized(&self, _: InitializedParams) {
         info!("P4 Language Server initialized");
+
+        {
+            let project = self.project.read().unwrap();
+            project.rebuild_all_roots();
+        }
+
         self.client
             .log_message(MessageType::INFO, "P4 Language Server initialized")
             .await;
@@ -455,6 +541,17 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
         let text = &params.text_document.text;
+        let file_path: FilePath = Arc::new(uri.path().to_string());
+
+        {
+            let project = self.project.read().unwrap();
+            project.update_file(
+                file_path.clone(),
+                params.text_document.version,
+                text.clone(),
+            );
+            project.invalidate_file(&file_path);
+        }
 
         let doc = self.parse_document(&uri, text);
         let diagnostics = doc.diagnostics.clone();
@@ -467,7 +564,19 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        let file_path: FilePath = Arc::new(uri.path().to_string());
+
         if let Some(change) = params.content_changes.into_iter().next() {
+            {
+                let project = self.project.read().unwrap();
+                project.update_file(
+                    file_path.clone(),
+                    params.text_document.version,
+                    change.text.clone(),
+                );
+                project.invalidate_file(&file_path);
+            }
+
             let doc = self.parse_document(&uri, &change.text);
             let diagnostics = doc.diagnostics.clone();
             self.documents.insert(uri.clone(), doc);
@@ -487,6 +596,28 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         if let Some(doc) = self.documents.get(uri) {
+            // Try project-level AST first (includes symbols from all included files)
+            let file_path: FilePath = Arc::new(uri.path().to_string());
+            {
+                let project = self.project.read().unwrap();
+                if let Some(root_path) = project.find_root_for_file(&file_path) {
+                    if let Some(unit) = project.roots.get(&root_path) {
+                        if let Some(hover_info) =
+                            analysis::get_hover_info(&unit.ast, &doc.content, position)
+                        {
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: hover_info,
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            // Fall back to document-local AST
             if let Some(ast) = &doc.ast {
                 if let Some(hover_info) = analysis::get_hover_info(ast, &doc.content, position) {
                     return Ok(Some(Hover {
@@ -527,11 +658,31 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
 
         if let Some(doc) = self.documents.get(uri) {
+            // Try project-level AST first
+            let file_path: FilePath = Arc::new(uri.path().to_string());
+            {
+                let project = self.project.read().unwrap();
+                if let Some(root_path) = project.find_root_for_file(&file_path) {
+                    if let Some(unit) = project.roots.get(&root_path) {
+                        let completions = analysis::get_completions_with_context(
+                            &unit.ast,
+                            &doc.content,
+                            position,
+                        );
+                        return Ok(Some(CompletionResponse::Array(completions)));
+                    }
+                }
+            }
+
+            // Fall back to document-local AST
             if let Some(ast) = &doc.ast {
-                let completions = analysis::get_completions_with_context(ast, &doc.content, position);
+                let completions =
+                    analysis::get_completions_with_context(ast, &doc.content, position);
                 return Ok(Some(CompletionResponse::Array(completions)));
             }
-            return Ok(Some(CompletionResponse::Array(analysis::get_keyword_completions())));
+            return Ok(Some(CompletionResponse::Array(
+                analysis::get_keyword_completions(),
+            )));
         }
         Ok(None)
     }
@@ -548,8 +699,26 @@ impl LanguageServer for Backend {
                 return Ok(Some(GotoDefinitionResponse::Scalar(location)));
             }
 
+            // Try project-level AST first (includes symbols from all included files)
+            let file_path: FilePath = Arc::new(uri.path().to_string());
+            {
+                let project = self.project.read().unwrap();
+                if let Some(root_path) = project.find_root_for_file(&file_path) {
+                    if let Some(unit) = project.roots.get(&root_path) {
+                        if let Some(location) =
+                            analysis::get_definition_location(&unit.ast, &doc.content, position)
+                        {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
+                        }
+                    }
+                }
+            }
+
+            // Fall back to document-local AST
             if let Some(ast) = &doc.ast {
-                if let Some(location) = analysis::get_definition_location(ast, &doc.content, position) {
+                if let Some(location) =
+                    analysis::get_definition_location(ast, &doc.content, position)
+                {
                     return Ok(Some(GotoDefinitionResponse::Scalar(location)));
                 }
             }
@@ -601,13 +770,7 @@ impl Backend {
         if let Some(ast) = &doc.ast {
             let mut add = |token: &p4::lexer::Token, token_type: SemanticTokenType| {
                 if let Some(relative) = token_relative(token, &doc.content) {
-                    builder.push(
-                        relative.0,
-                        relative.1,
-                        relative.2,
-                        token_type,
-                        &[],
-                    );
+                    builder.push(relative.0, relative.1, relative.2, token_type, &[]);
                 }
             };
 
@@ -631,12 +794,21 @@ impl Backend {
             }
             for pkg in &ast.packages {
                 add(&pkg.token, SemanticTokenType::TYPE);
+                for tp in &pkg.type_parameters {
+                    add(&tp.token, SemanticTokenType::TYPE_PARAMETER);
+                }
                 for p in &pkg.parameters {
                     add(&p.token, SemanticTokenType::PARAMETER);
+                    for tp in &p.type_parameters {
+                        add(&tp.token, SemanticTokenType::TYPE_PARAMETER);
+                    }
                 }
             }
             for control in &ast.controls {
                 add(&control.token, SemanticTokenType::TYPE);
+                for tp in &control.type_parameters {
+                    add(&tp.token, SemanticTokenType::TYPE_PARAMETER);
+                }
                 for p in &control.parameters {
                     add(&p.name_token, SemanticTokenType::PARAMETER);
                 }
@@ -655,6 +827,9 @@ impl Backend {
             }
             for parser in &ast.parsers {
                 add(&parser.token, SemanticTokenType::TYPE);
+                for tp in &parser.type_parameters {
+                    add(&tp.token, SemanticTokenType::TYPE_PARAMETER);
+                }
                 for p in &parser.parameters {
                     add(&p.name_token, SemanticTokenType::PARAMETER);
                 }
@@ -666,6 +841,9 @@ impl Backend {
                 add(&ext.token, SemanticTokenType::TYPE);
                 for m in &ext.methods {
                     add(&m.token, SemanticTokenType::METHOD);
+                    for tp in &m.type_parameters {
+                        add(&tp.token, SemanticTokenType::TYPE_PARAMETER);
+                    }
                     for p in &m.parameters {
                         add(&p.name_token, SemanticTokenType::PARAMETER);
                     }
@@ -691,20 +869,12 @@ impl Backend {
         encode_relative_tokens(builder.build().data)
     }
 
-    fn collect_semantic_tokens_range(
-        &self,
-        doc: &Document,
-        range: Range,
-    ) -> Vec<SemanticToken> {
+    fn collect_semantic_tokens_range(&self, doc: &Document, range: Range) -> Vec<SemanticToken> {
         let all = self.collect_semantic_tokens(doc);
         filter_tokens_by_range(all, range)
     }
 
-    fn add_lexical_semantic_tokens(
-        &self,
-        doc: &Document,
-        builder: &mut SemanticTokensBuilder,
-    ) {
+    fn add_lexical_semantic_tokens(&self, doc: &Document, builder: &mut SemanticTokensBuilder) {
         let lines: Vec<String> = doc
             .content
             .lines()
@@ -713,6 +883,30 @@ impl Backend {
 
         let mut type_names = HashSet::new();
         let mut action_names = HashSet::new();
+        let mut type_parameter_names = HashSet::new();
+
+        // First, collect symbols from project-level analysis (cross-file visibility)
+        let file_path: FilePath = Arc::new(doc.uri.path().to_string());
+        let symbol_kinds = self.get_symbol_kinds(&file_path);
+        for (name, kind) in &symbol_kinds {
+            match kind {
+                SymbolKind::Header
+                | SymbolKind::Struct
+                | SymbolKind::Typedef
+                | SymbolKind::Extern
+                | SymbolKind::Control
+                | SymbolKind::Parser
+                | SymbolKind::Package => {
+                    type_names.insert(name.clone());
+                }
+                SymbolKind::Action | SymbolKind::Table => {
+                    action_names.insert(name.clone());
+                }
+                _ => {}
+            }
+        }
+
+        // Also collect from local AST for files not yet in project index
         if let Some(ast) = &doc.ast {
             for header in &ast.headers {
                 type_names.insert(header.name.clone());
@@ -725,21 +919,40 @@ impl Backend {
             }
             for ext in &ast.externs {
                 type_names.insert(ext.name.clone());
+                for m in &ext.methods {
+                    for tp in &m.type_parameters {
+                        type_parameter_names.insert(tp.name.clone());
+                    }
+                }
             }
             for control in &ast.controls {
                 type_names.insert(control.name.clone());
+                for tp in &control.type_parameters {
+                    type_parameter_names.insert(tp.name.clone());
+                }
                 for action in &control.actions {
                     action_names.insert(action.name.clone());
                 }
             }
             for parser in &ast.parsers {
                 type_names.insert(parser.name.clone());
+                for tp in &parser.type_parameters {
+                    type_parameter_names.insert(tp.name.clone());
+                }
                 for state in &parser.states {
                     action_names.insert(state.name.clone());
                 }
             }
             for pkg in &ast.packages {
                 type_names.insert(pkg.name.clone());
+                for tp in &pkg.type_parameters {
+                    type_parameter_names.insert(tp.name.clone());
+                }
+                for p in &pkg.parameters {
+                    for tp in &p.type_parameters {
+                        type_parameter_names.insert(tp.name.clone());
+                    }
+                }
             }
         }
 
@@ -806,9 +1019,10 @@ impl Backend {
                 | p4::lexer::Kind::Int
                 | p4::lexer::Kind::String => (Some(SemanticTokenType::TYPE), 1),
                 p4::lexer::Kind::PoundDefine | p4::lexer::Kind::PoundInclude => (None, 1),
-                p4::lexer::Kind::IntLiteral(value) => {
-                    (Some(SemanticTokenType::NUMBER), value.to_string().len() as u32)
-                }
+                p4::lexer::Kind::IntLiteral(value) => (
+                    Some(SemanticTokenType::NUMBER),
+                    value.to_string().len() as u32,
+                ),
                 p4::lexer::Kind::BitLiteral(width, value) => {
                     let text = format!("{}w{}", width, value);
                     (Some(SemanticTokenType::NUMBER), text.len() as u32)
@@ -851,6 +1065,8 @@ impl Backend {
                 p4::lexer::Kind::Identifier(value) => {
                     if let Some(token_type) = analysis::builtin_token_type_for_identifier(value) {
                         (Some(token_type), value.len() as u32)
+                    } else if type_parameter_names.contains(value) {
+                        (Some(SemanticTokenType::TYPE_PARAMETER), value.len() as u32)
                     } else if type_names.contains(value) {
                         (Some(SemanticTokenType::STRUCT), value.len() as u32)
                     } else if action_names.contains(value) {
@@ -863,13 +1079,7 @@ impl Backend {
             };
 
             if let Some(token_type) = token_type {
-                builder.push(
-                    token.line as u32,
-                    token.col as u32,
-                    length,
-                    token_type,
-                    &[],
-                );
+                builder.push(token.line as u32, token.col as u32, length, token_type, &[]);
             }
 
             if token.kind == p4::lexer::Kind::Eof {
@@ -890,9 +1100,7 @@ fn token_relative(token: &p4::lexer::Token, content: &Rope) -> Option<(u32, u32,
         p4::lexer::Kind::Identifier(value) => value.len(),
         p4::lexer::Kind::IntLiteral(value) => value.to_string().len(),
         p4::lexer::Kind::BitLiteral(width, value) => format!("{}w{}", width, value).len(),
-        p4::lexer::Kind::SignedLiteral(width, value) => {
-            format!("{}s{}", width, value).len()
-        }
+        p4::lexer::Kind::SignedLiteral(width, value) => format!("{}s{}", width, value).len(),
         p4::lexer::Kind::StringLiteral(value) => value.len() + 2,
         p4::lexer::Kind::TrueLiteral => 4,
         p4::lexer::Kind::FalseLiteral => 5,
@@ -1028,9 +1236,7 @@ fn encode_relative_tokens(tokens: Vec<SemanticToken>) -> Vec<SemanticToken> {
     }
 
     encoded
-
 }
-
 
 #[tokio::main]
 async fn main() {
