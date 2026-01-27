@@ -1,12 +1,14 @@
 use dashmap::DashMap;
 use log::info;
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use p4::ast::AST;
@@ -29,6 +31,19 @@ struct Document {
     ast: Option<AST>,
     diagnostics: Vec<Diagnostic>,
     macros: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexStatusParams {
+    busy: bool,
+    detail: Option<String>,
+}
+
+enum IndexStatusNotification {}
+
+impl Notification for IndexStatusNotification {
+    type Params = IndexStatusParams;
+    const METHOD: &'static str = "p4/indexStatus";
 }
 
 struct Backend {
@@ -126,6 +141,85 @@ impl Backend {
             documents: DashMap::new(),
             semantic_tokens,
             project: RwLock::new(ProjectState::new()),
+        }
+    }
+
+    async fn set_index_status(&self, busy: bool, detail: Option<String>) {
+        let params = IndexStatusParams { busy, detail };
+        self.client
+            .send_notification::<IndexStatusNotification>(params)
+            .await;
+    }
+
+    fn short_name(path: &str) -> String {
+        Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string()
+    }
+
+    async fn rebuild_all_roots_with_indicator(&self) {
+        let roots = {
+            let project = self.project.read().unwrap();
+            project.discover_roots()
+        };
+        let total = roots.len();
+
+        for (idx, root_path) in roots.into_iter().enumerate() {
+            let detail = Some(format!(
+                "Indexing ({}/{}) {}",
+                idx + 1,
+                total,
+                Self::short_name(root_path.as_str())
+            ));
+            self.set_index_status(true, detail).await;
+
+            {
+                let project = self.project.read().unwrap();
+                if let Some(unit) = project.compile_root(&root_path) {
+                    for file in &unit.include_order {
+                        project
+                            .file_to_roots
+                            .entry(file.clone())
+                            .or_default()
+                            .insert(root_path.clone());
+                    }
+                    project.roots.insert(root_path.clone(), unit);
+                }
+            }
+        }
+
+        self.set_index_status(false, None).await;
+    }
+
+    async fn rebuild_roots_for_file_with_indicator(&self, file: &FilePath) {
+        let roots_to_rebuild: Vec<FilePath> = {
+            let project = self.project.read().unwrap();
+            project
+                .file_to_roots
+                .get(file)
+                .map(|r| r.iter().cloned().collect())
+                .unwrap_or_default()
+        };
+        let total = roots_to_rebuild.len();
+
+        for (idx, root_path) in roots_to_rebuild.into_iter().enumerate() {
+            let detail = Some(format!(
+                "Indexing ({}/{}) {}",
+                idx + 1,
+                total,
+                Self::short_name(root_path.as_str())
+            ));
+            self.set_index_status(true, detail).await;
+            {
+                let project = self.project.read().unwrap();
+                project.rebuild_root(&root_path);
+            }
+        }
+
+        if total > 0 {
+            self.set_index_status(false, None).await;
         }
     }
 
@@ -257,7 +351,8 @@ impl Backend {
         let mut ast = AST::default();
         let mut macros = Vec::new();
         let env_in = MacroEnv::default();
-        self.process_file_content(text, filename, &mut ast, &mut macros, &env_in)?;
+        let mut include_stack = HashSet::new();
+        self.process_file_content(text, filename, &mut ast, &mut macros, &env_in, &mut include_stack)?;
 
         let (_, diags) = check::all(&ast);
         Ok((ast, diags, macros))
@@ -272,7 +367,21 @@ impl Backend {
         ast: &mut AST,
         macros: &mut Vec<(String, String)>,
         env_in: &MacroEnv,
+        include_stack: &mut HashSet<String>,
     ) -> std::result::Result<MacroEnv, CompileError> {
+        if include_stack.len() > 128 {
+            return Ok(env_in.clone());
+        }
+
+        let filename_canonical = fs::canonicalize(filename.as_str())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| filename.as_str().to_string());
+
+        if include_stack.contains(&filename_canonical) {
+            return Ok(env_in.clone());
+        }
+        include_stack.insert(filename_canonical.clone());
+
         let ppr = p4::preprocessor::run_with_env(text, filename.clone(), env_in)
             .map_err(CompileError::Preprocessor)?;
 
@@ -302,6 +411,7 @@ impl Backend {
                     ast,
                     macros,
                     &current_env,
+                    include_stack,
                 )?;
             }
         }
@@ -310,6 +420,7 @@ impl Backend {
         let mut parser = Parser::new(lexer);
         parser.run(ast).map_err(CompileError::P4)?;
 
+        include_stack.remove(&filename_canonical);
         Ok(current_env)
     }
 
@@ -524,10 +635,7 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         info!("P4 Language Server initialized");
 
-        {
-            let project = self.project.read().unwrap();
-            project.rebuild_all_roots();
-        }
+        self.rebuild_all_roots_with_indicator().await;
 
         self.client
             .log_message(MessageType::INFO, "P4 Language Server initialized")
@@ -550,8 +658,8 @@ impl LanguageServer for Backend {
                 params.text_document.version,
                 text.clone(),
             );
-            project.invalidate_file(&file_path);
         }
+        self.rebuild_roots_for_file_with_indicator(&file_path).await;
 
         let doc = self.parse_document(&uri, text);
         let diagnostics = doc.diagnostics.clone();
@@ -574,8 +682,8 @@ impl LanguageServer for Backend {
                     params.text_document.version,
                     change.text.clone(),
                 );
-                project.invalidate_file(&file_path);
             }
+            self.rebuild_roots_for_file_with_indicator(&file_path).await;
 
             let doc = self.parse_document(&uri, &change.text);
             let diagnostics = doc.diagnostics.clone();
@@ -851,21 +959,6 @@ impl Backend {
             }
         }
 
-        for (name, _body) in &doc.macros {
-            for (line_idx, line) in doc.content.lines().enumerate() {
-                let line_str: String = line.chars().collect();
-                if let Some(col) = line_str.find(name) {
-                    builder.push(
-                        line_idx as u32,
-                        col as u32,
-                        name.len() as u32,
-                        SemanticTokenType::MACRO,
-                        &[],
-                    );
-                }
-            }
-        }
-
         encode_relative_tokens(builder.build().data)
     }
 
@@ -884,6 +977,11 @@ impl Backend {
         let mut type_names = HashSet::new();
         let mut action_names = HashSet::new();
         let mut type_parameter_names = HashSet::new();
+        let mut macro_names = HashSet::new();
+
+        for (name, _) in &doc.macros {
+            macro_names.insert(name.clone());
+        }
 
         // First, collect symbols from project-level analysis (cross-file visibility)
         let file_path: FilePath = Arc::new(doc.uri.path().to_string());
@@ -1071,6 +1169,8 @@ impl Backend {
                         (Some(SemanticTokenType::STRUCT), value.len() as u32)
                     } else if action_names.contains(value) {
                         (Some(SemanticTokenType::FUNCTION), value.len() as u32)
+                    } else if macro_names.contains(value) {
+                        (Some(SemanticTokenType::MACRO), value.len() as u32)
                     } else {
                         (Some(SemanticTokenType::VARIABLE), value.len() as u32)
                     }
