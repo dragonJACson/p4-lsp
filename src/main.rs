@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use log::info;
+
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -20,6 +20,7 @@ use p4::preprocessor::MacroEnv;
 use tower_lsp::lsp_types::SemanticTokenType;
 
 mod analysis;
+mod config;
 mod project;
 
 use project::{FilePath, ProjectState, SymbolKind};
@@ -151,6 +152,18 @@ impl Backend {
             .await;
     }
 
+    async fn log_info(&self, message: impl Into<String>) {
+        self.client
+            .log_message(MessageType::INFO, message.into())
+            .await;
+    }
+
+    async fn log_warn(&self, message: impl Into<String>) {
+        self.client
+            .log_message(MessageType::WARNING, message.into())
+            .await;
+    }
+
     fn short_name(path: &str) -> String {
         Path::new(path)
             .file_name()
@@ -160,13 +173,23 @@ impl Backend {
     }
 
     async fn rebuild_all_roots_with_indicator(&self) {
-        let roots = {
+        let (roots, has_config) = {
             let project = self.project.read().unwrap();
-            project.discover_roots()
+            (project.discover_roots(), project.config.is_some())
         };
         let total = roots.len();
 
+        if has_config {
+            self.log_info(format!("Using {} explicit targets from config", total))
+                .await;
+        } else {
+            self.log_info(format!("Auto-discovered {} root files", total))
+                .await;
+        }
+
         for (idx, root_path) in roots.into_iter().enumerate() {
+            self.log_info(format!("Compiling root: {}", root_path)).await;
+
             let detail = Some(format!(
                 "Indexing ({}/{}) {}",
                 idx + 1,
@@ -175,9 +198,32 @@ impl Backend {
             ));
             self.set_index_status(true, detail).await;
 
-            {
+            let result = {
                 let project = self.project.read().unwrap();
-                if let Some(unit) = project.compile_root(&root_path) {
+                project.compile_root(&root_path)
+            };
+
+            match result {
+                Some(unit) => {
+                    self.log_info(format!(
+                        "  Compiled {} with {} files, {} symbols",
+                        Self::short_name(root_path.as_str()),
+                        unit.include_order.len(),
+                        unit.symbols.symbols.len()
+                    ))
+                    .await;
+
+                    // Log processed files
+                    for file in &unit.include_order {
+                        self.log_info(format!("    Processed: {}", file)).await;
+                    }
+
+                    // Log any warnings (e.g., unresolved includes, parse errors)
+                    for warning in &unit.warnings {
+                        self.log_warn(format!("  {}", warning)).await;
+                    }
+
+                    let project = self.project.read().unwrap();
                     for file in &unit.include_order {
                         project
                             .file_to_roots
@@ -186,6 +232,13 @@ impl Backend {
                             .insert(root_path.clone());
                     }
                     project.roots.insert(root_path.clone(), unit);
+                }
+                None => {
+                    self.log_warn(format!(
+                        "  Failed to compile {}",
+                        Self::short_name(root_path.as_str())
+                    ))
+                    .await;
                 }
             }
         }
@@ -546,8 +599,32 @@ impl Backend {
         };
 
         let filename = doc.uri.path();
-        let include_path = resolve_include_path(filename, &path)?;
-        let include_uri = Url::from_file_path(&include_path).ok()?;
+        let file_path: FilePath = Arc::new(filename.to_string());
+
+        // Use project's include resolution (respects includePaths config)
+        let include_path = {
+            let project = self.project.read().unwrap();
+            // Get include paths for the root that contains this file
+            let include_paths = if let Some(root_path) = project.find_root_for_file(&file_path) {
+                project.include_paths_for_root(&root_path)
+            } else {
+                project.include_paths.clone()
+            };
+            project::ProjectState::resolve_include_with_paths(&file_path, &path, &include_paths)
+        };
+
+        let resolved = include_path.or_else(|| {
+            // Fallback to simple relative resolution
+            let parent = Path::new(filename).parent().unwrap_or(Path::new("."));
+            let relative = parent.join(&path);
+            if relative.exists() {
+                Some(Arc::new(relative.to_string_lossy().to_string()))
+            } else {
+                None
+            }
+        })?;
+
+        let include_uri = Url::from_file_path(resolved.as_str()).ok()?;
         let col = trimmed.find(&path)? + start_offset;
 
         Some(Location {
@@ -566,15 +643,6 @@ impl Backend {
     }
 }
 
-fn resolve_include_path(current_file: &str, include: &str) -> Option<String> {
-    let include_path = Path::new(include);
-    if include_path.is_absolute() {
-        return Some(include_path.to_string_lossy().to_string());
-    }
-    let parent = Path::new(current_file).parent().unwrap_or(Path::new("."));
-    Some(parent.join(include).to_string_lossy().to_string())
-}
-
 enum CompileError {
     Preprocessor(PreprocessorError),
     P4(Error),
@@ -583,18 +651,17 @@ enum CompileError {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        if let Some(root_uri) = params.root_uri {
-            if let Ok(path) = root_uri.to_file_path() {
-                let mut project = self.project.write().unwrap();
-                project.set_workspace_root(path);
-            }
+        let workspace_path = if let Some(root_uri) = params.root_uri {
+            root_uri.to_file_path().ok()
         } else if let Some(folders) = params.workspace_folders {
-            if let Some(folder) = folders.first() {
-                if let Ok(path) = folder.uri.to_file_path() {
-                    let mut project = self.project.write().unwrap();
-                    project.set_workspace_root(path);
-                }
-            }
+            folders.first().and_then(|f| f.uri.to_file_path().ok())
+        } else {
+            None
+        };
+
+        if let Some(path) = workspace_path {
+            let mut project = self.project.write().unwrap();
+            project.set_workspace_root(path);
         }
 
         Ok(InitializeResult {
@@ -633,13 +700,43 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        info!("P4 Language Server initialized");
+        // Collect info from project state (don't hold lock across await)
+        let (workspace_root, config_info) = {
+            let project = self.project.read().unwrap();
+            let root = project.workspace_root.as_ref().map(|r| r.display().to_string());
+            let config = project.config.as_ref().map(|c| {
+                let targets: Vec<_> = c
+                    .targets
+                    .iter()
+                    .map(|t| (t.name.clone(), t.root.display().to_string()))
+                    .collect();
+                (c.targets.len(), c.include_paths.len(), targets)
+            });
+            (root, config)
+        };
+
+        // Log workspace and config info
+        if let Some(root) = workspace_root {
+            self.log_info(format!("Workspace root: {}", root)).await;
+        }
+        if let Some((target_count, include_count, targets)) = config_info {
+            self.log_info(format!(
+                "Loaded .p4lsp.json: {} targets, {} include paths",
+                target_count, include_count
+            ))
+            .await;
+            for (name, path) in targets {
+                self.log_info(format!("  Target '{}': {}", name, path))
+                    .await;
+            }
+        } else {
+            self.log_info("No .p4lsp.json found, using auto-discovery")
+                .await;
+        }
 
         self.rebuild_all_roots_with_indicator().await;
 
-        self.client
-            .log_message(MessageType::INFO, "P4 Language Server initialized")
-            .await;
+        self.log_info("P4 Language Server initialized").await;
     }
 
     async fn shutdown(&self) -> Result<()> {

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/example/p4-lsp/main/schema.json",
+  "version": 1,
+  "_comment": "Place this file as .p4lsp.json in workspace root (folder opened in VSCode)",
+  "includePaths": [
+    "include",
+    "/opt/p4/share/p4include"
+  ],
+  "targets": [
+    {
+      "name": "pipeline_tx",
+      "root": "pipeline-tx/pipeline_tx.p4",
+      "_comment": "Paths are relative to workspace root (where .p4lsp.json is)"
+    },
+    {
+      "name": "pipeline_rx",
+      "root": "pipeline-rx/pipeline_rx.p4",
+      "includePaths": ["pipeline-rx/local-include"]
+    }
+  ]
+}
